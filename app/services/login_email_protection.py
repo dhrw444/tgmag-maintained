@@ -1,3 +1,27 @@
+"""登录邮箱自动保护。
+
+Telegram 换绑登录邮箱时会给账号邮箱发一封带验证码的信。这个模块负责：监听
+账号收到的「登录邮箱被改」提醒 → 自己生成新别名邮箱 → 从邮件里取出验证码 →
+替账号完成换绑 → 通知管理员。
+
+四条链路都在这里，改动时要一起看：
+
+1. **提醒识别**（is_login_email_protection_alert / is_premium_notice）。
+   按多语言正则匹配，语种覆盖不全时宁可漏判也不要误判 —— 误判会把
+   无关消息当成换绑事件处理。
+2. **验证码提取**（parse_telegram_login_email + 两个 CodeReader）。
+   两种后端：Cloudflare TempMail 走 webhook 入库后轮询数据库，
+   Gmail 走 IMAP。RoutedCodeReader 按域名选后端。
+3. **等待窗口**（LoginEmailProtector.wait_for_window）。换绑后给一个可配置的
+   等待期，期间用户可以手动提交验证码；窗口结束后才由本模块代填。
+   窗口状态存在内存字典里，进程重启后靠 recover_incomplete_events 从库里恢复。
+4. **换绑执行**（_execute_change / retry / resume_waiting_email）。
+   真正调用 Telegram API 的地方，失败原因要转成给人看的中文。
+
+所有涉及账号凭证的字段（目标邮箱、2FA 密码、提示语）在库里都是密文，
+读写一律走 crypto 的 encrypt_text / decrypt_text。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -91,6 +115,8 @@ EMAIL_LOGIN_PURPOSE_PATTERN = re.compile(
 
 @dataclass(frozen=True)
 class TelegramLoginEmailCode:
+    """从邮件里取出的验证码。recipient 是收件地址，用于回报是哪条别名收到的。"""
+
     code: str
     recipient: str
     sent_at: datetime | None
@@ -106,6 +132,7 @@ class LoginEmailWindowNotice:
 
 
 def format_wait_deadline(seconds: float, *, now: datetime | None = None) -> str:
+    """把剩余秒数格式化成「X 小时 Y 分」这类中文描述。now 只用于测试注入。"""
     current = now or datetime.now(UTC)
     if current.tzinfo is None:
         current = current.replace(tzinfo=UTC)
@@ -122,6 +149,7 @@ def login_email_wait_remaining(
     *,
     now: datetime | None = None,
 ) -> float:
+    """返回等待窗口还剩多少秒；没有起点或已过期时返回 0。"""
     if requested_at is None:
         return float(settings.login_email_poll_timeout_seconds)
     if requested_at.tzinfo is None:
@@ -136,6 +164,11 @@ def login_email_wait_remaining(
 
 
 def parse_login_email_window_hours(raw_hours: object) -> int:
+    """把配置里的窗口小时数解析成整数。
+
+    这个值来自运行时设置表，可能是任何历史版本写进去的东西，因此非法值
+    回落到默认值而不是抛错。
+    """
     if isinstance(raw_hours, bool):
         raise ValueError("时长必须是 0–720 之间的整数小时")
     try:
@@ -168,6 +201,11 @@ def is_premium_notice(text: str) -> bool:
 
 
 def is_login_email_protection_alert(text: str) -> bool:
+    """综合判断：是登录验证码提醒且不是 Premium 推广。
+
+    调用方只调这一个就够了，不要分别调上面两个再自己组合 —— 组合逻辑漏掉
+    任一半都会让无关消息进入换绑流程。
+    """
     return is_login_code_alert(text) or is_premium_notice(text)
 
 
@@ -264,7 +302,14 @@ def parse_telegram_login_email(
 
 
 class GmailCodeReader:
+    """通过 IMAP 从 Gmail 里取 Telegram 登录验证码。
+
+    连接和搜索都在线程里跑（imaplib 是阻塞库），协程侧用 asyncio.to_thread 等结果，
+    避免卡住事件循环。每次取码都是独立连接，不复用 —— Gmail 长时间空闲会断开，
+    复用反而要处理更多重连分支。
+    """
     def validate_connection_sync(self) -> None:
+        """同步验证 IMAP 登录与收件夹可读，失败抛异常。仅用于健康检查，不参与取码。"""
         connection = imaplib.IMAP4_SSL(
             settings.login_email_imap_host,
             settings.login_email_imap_port,
@@ -294,6 +339,11 @@ class GmailCodeReader:
         timeout_seconds: float | None = None,
         cancel_event: threading.Event | None = None,
     ) -> str:
+        """阻塞轮询收件夹直到取到验证码或超时，超时抛 TimeoutError。
+
+        由 wait_for_code 放进线程执行。cancel_event 被置位时提前返回并抛
+        TimeoutError，用于取消正在等码的账号操作。
+        """
         timeout = (
             settings.login_email_poll_timeout_seconds
             if timeout_seconds is None
@@ -386,6 +436,12 @@ class GmailCodeReader:
 
 
 class TempMailCodeReader:
+    """从本地 temp_mail_messages 表取验证码。
+
+    Cloudflare TempMail 的 webhook 先把邮件入库，这里只轮询数据库。
+    不直接调 Cloudflare API 的原因：webhook 是推送模型，轮询 API 会重复拉取
+    已经处理过的邮件，而且限流更紧。
+    """
     def __init__(self, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
         self.sessionmaker = sessionmaker
 
@@ -397,6 +453,11 @@ class TempMailCodeReader:
 
     @staticmethod
     def _extract_code(message: TempMailMessage, target_email: str) -> str | None:
+        """从一行 temp_mail_messages 里取验证码。
+
+        发件人不在白名单、收件人不匹配、取不到码都返回 None —— 邮箱里
+        无关邮件是常态，不构成错误。
+        """
         senders = {
             address.lower()
             for _, address in getaddresses([message.sender or ""])
@@ -698,6 +759,14 @@ def build_alias(phone: str, domain: str, timestamp: int | None = None) -> str:
 
 
 class LoginEmailProtector:
+    """登录邮箱保护的主状态机。
+
+    生命周期：record_alert 收到换绑提醒 → 开等待窗口（wait_for_window 在后台跑）
+    → 窗口结束后 _execute_change 代填验证码 → 结果通过 _notify 通知管理员。
+
+    并发约束：同一账号同一时刻只允许一个进行中的换绑（has_change_in_progress），
+    窗口等待任务登记在 _window_waiters 里，cancel_account_tasks 是唯一的取消入口。
+    """
     def __init__(
         self,
         sessionmaker: async_sessionmaker[AsyncSession],
@@ -808,6 +877,11 @@ class LoginEmailProtector:
         text: str,
         client: TelegramClient,
     ) -> None:
+        """换绑提醒的统一入口：判类型 → 记录事件 → 需要时开等待窗口。
+
+        不是登录邮箱提醒的消息直接返回，不做任何写库。同一条提醒重复投递时
+        record_alert 返回 None，因此不会重复开窗。
+        """
         if not is_login_email_protection_alert(text):
             return
         notice = await self.record_alert(account_id, service_message_id)
@@ -828,6 +902,11 @@ class LoginEmailProtector:
         account_id: int,
         service_message_id: int,
     ) -> LoginEmailWindowNotice | None:
+        """在已持锁的前提下记录一条提醒事件，返回窗口快照。
+
+        同一条 service_message 只会被记一次；窗口内重复提醒只累加 alert_count，
+        只有 starts_new_window 为 True 时才需要调用方起等待任务。
+        """
         async with self.sessionmaker() as session:
             existing = await session.scalar(
                 select(LoginEmailProtectionEvent).where(
@@ -950,6 +1029,11 @@ class LoginEmailProtector:
         event_id: int,
         client: TelegramClient,
     ) -> None:
+        """后台等待窗口结束，然后执行换绑。
+
+        把自己登记进 _window_waiters 供 cancel_account_tasks 取消。
+        同一 event_id 已有别的任务在等时直接返回，避免重复执行换绑。
+        """
         current_task = asyncio.current_task()
         if current_task is None:
             return
@@ -1003,6 +1087,11 @@ class LoginEmailProtector:
         self,
         event_id: int,
     ) -> tuple[int, str, str] | None:
+        """窗口结束后做执行前的最终校验，返回 (account_id, 目标邮箱, 域名)。
+
+        事件已不在 waiting_window 状态、窗口截止时间缺失、账号状态不允许时
+        返回 None 并把事件标成失败，调用方据此跳过换绑。
+        """
         async with self.sessionmaker() as session:
             event = await session.get(LoginEmailProtectionEvent, event_id)
             if event is None or event.status != "waiting_window":
@@ -1118,6 +1207,11 @@ class LoginEmailProtector:
 
     @staticmethod
     def _friendly_failure_reason(exc: Exception) -> str:
+        """把 Telegram / 网络异常翻译成给用户看的中文说明。
+
+        重点是把「能不能重试」讲清楚：FloodError 必须告知等待时长，
+        否则用户会连续重试把自己锁得更久。
+        """
         if isinstance(exc, FloodError):
             seconds = int(getattr(exc, "seconds", 0) or 0)
             if seconds:
@@ -1199,6 +1293,12 @@ class LoginEmailProtector:
         requested_at: datetime | None = None,
         wait_timeout_seconds: float | None = None,
     ) -> None:
+        """真正调用 Telegram 换绑登录邮箱，并把结果写回事件与通知。
+
+        调用方必须已经通过 _prepare_window_change 校验。所有异常在这里被
+        收口成事件状态 + 通知，不向调用方抛 —— 它在后台任务里跑，
+        抛出去只会变成一条无人接收的 task 异常。
+        """
         summary = await self._window_summary(event_id)
         try:
             if requested_at is None:
