@@ -46,6 +46,8 @@ class SecurityHealthReport:
 
     @property
     def available(self) -> bool:
+        """该项检查所需的依赖是否齐备；不齐时报告里显示为「未配置」而不是失败。
+        """
         return all(check.status == "pass" for check in self.checks)
 
     def render(self) -> str:

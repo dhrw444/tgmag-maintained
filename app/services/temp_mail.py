@@ -157,5 +157,9 @@ async def latest_message_for_recipient(
     session: AsyncSession,
     recipient: str,
 ) -> TempMailMessage | None:
+    """取该收件人最新一条临时邮件，没有则返回 None。
+
+    换绑流程只关心「最新的那封」，旧邮件可能是上一次登录留下的验证码。
+    """
     messages = await list_messages_for_recipient(session, recipient, limit=1)
     return messages[0] if messages else None

@@ -313,6 +313,11 @@ def parse_session_import_payload(content: str) -> list[tuple[str, str]]:
     current: dict[str, str] = {}
 
     def flush_current() -> None:
+        """把缓冲里这一条（手机号 + Session 串）提交到 accounts，缺任一项就静默跳过。
+
+        解析粘贴内容时最后一段可能只写了一半，跳过比报错更合适 —— 用户还能
+        在前面的段落里拿到已解析成功的账号。
+        """
         phone = (current.get("phone") or "").strip()
         session_str = (current.get("string_session") or current.get("session") or "").strip()
         if phone and session_str:
@@ -1627,6 +1632,12 @@ async def run_one_or_many(
     func,
     *op_args,
 ) -> None:
+    """对多个账号跑同一个批量动作（spam/send/react/forward/subscribe 等共用入口）。
+
+    func 是每个账号要执行的协程函数，*op_args 原样透传。任何一个账号失败只
+    计入 failed 并继续，最后汇总成一条结果消息；目标不在允许名单时直接回提示
+    并中止，不会建 job。
+    """
     async with sessionmaker() as session:
         try:
             await require_allowed_target(session, target_ref)
@@ -1676,6 +1687,10 @@ async def forward_to_target(
     source: str,
     message_id: int,
 ) -> dict[str, int]:
+    """把某个账号的指定消息转发到目标，返回本次转发统计。
+
+    真正的转发在 batch_ops 里，这里只是让 Bot 层不必直接依赖那个模块。
+    """
     return await batch_ops.forward(client_pool, account_id, source, message_id, target)
 
 
@@ -2537,6 +2552,11 @@ async def login_email_guard_view(
     session: AsyncSession,
     client_pool: ClientPool,
 ) -> tuple[str, InlineKeyboardMarkup]:
+    """登录邮箱保护总览。
+
+    同时给出「库里登记为活跃」与「当前真的连着」两组账号数，用来暴露
+    连接池掉线这类状态漂移。
+    """
     domains = await get_available_domains(session)
     domain_backends = await get_domain_backends(session)
     selected_domain = await get_selected_domain(session)
@@ -2608,6 +2628,7 @@ async def login_email_guard_view(
 
 
 async def login_email_domains_view(session: AsyncSession) -> tuple[str, InlineKeyboardMarkup]:
+    """邮箱域名管理页，标出默认域名与每个域名的接收方式。"""
     domains = await get_available_domains(session)
     domain_backends = await get_domain_backends(session)
     selected = await get_selected_domain(session)
@@ -2626,6 +2647,7 @@ async def login_email_domains_view(session: AsyncSession) -> tuple[str, InlineKe
 
 
 async def login_email_whitelist_view(session: AsyncSession) -> tuple[str, InlineKeyboardMarkup]:
+    """白名单管理页，账号列表只取前 30 个，避免键盘超长。"""
     accounts = list(
         (await session.scalars(select(TgAccount).order_by(TgAccount.id).limit(30))).all()
     )
@@ -2639,6 +2661,7 @@ async def login_email_whitelist_view(session: AsyncSession) -> tuple[str, Inline
 
 
 async def login_email_events_view(session: AsyncSession) -> tuple[str, InlineKeyboardMarkup]:
+    """保护事件列表，只列根事件（parent_event_id 为空）并倒序取最近 20 条。"""
     events = list(
         (
             await session.scalars(
@@ -2657,6 +2680,7 @@ async def login_email_account_view(
     session: AsyncSession,
     account_id: int,
 ) -> tuple[str, InlineKeyboardMarkup]:
+    """单个账号的保护设置页：等待时长与白名单状态。"""
     account = await get_account(session, account_id)
     whitelisted = await session.get(LoginEmailWhitelist, account_id) is not None
     text = (

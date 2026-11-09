@@ -54,6 +54,11 @@ class ClientPool:
     """
 
     def __init__(self, sessionmaker: async_sessionmaker[AsyncSession], bot: Bot):
+        """建池并把登录邮箱保护器一起带上（两者共享同一个 sessionmaker/bot）。
+
+        监控默认开启，但真正的任务要等 start_service_monitor 才起；
+        所有账号级状态（客户端、锁、正在删除的标记）都按账号 id 分槽。
+        """
         self.sessionmaker = sessionmaker
         self.bot = bot
         self.clients: dict[int, TelegramClient] = {}
@@ -70,11 +75,12 @@ class ClientPool:
 
     @property
     def connected_account_ids(self) -> set[int]:
+        """当前真正处于连接状态的账号 id 集合，取自客户端实时状态而非登记表。"""
         return {account_id for account_id, client in self.clients.items() if client.is_connected()}
 
     @property
     def service_monitor_running(self) -> bool:
-        """Report the task's real state instead of trusting the enabled flag alone."""
+        """服务监控任务是否真的在跑 —— 只看开关会漏掉任务已退出的情况。"""
         task = self._monitor_task
         return bool(self.monitor_enabled and task is not None and not task.done())
 
@@ -279,6 +285,11 @@ class ClientPool:
             self._deleting_account_ids.discard(account_id)
 
     async def retry_login_email_protection(self, event_id: int, domain: str) -> None:
+        """后台重跑一次邮箱换绑，不阻塞调用方。
+
+        事件被删掉时抛 ValueError；重跑自身失败只记日志，不冒泡到任务外
+        —— 异步任务里抛出的异常没人接。
+        """
         async with self.sessionmaker() as session:
             event = await session.get(LoginEmailProtectionEvent, event_id)
             if event is None:
@@ -287,6 +298,7 @@ class ClientPool:
         client = await self.get_client(account_id)
 
         async def run() -> None:
+            """真正执行重跑；异常只记日志，不让任务静默带崩。"""
             try:
                 await self.login_email_protector.retry(event_id, domain, client)
             except Exception:

@@ -1,3 +1,9 @@
+"""全部内联/回复键盘的构造函数。
+
+这一层只负责「长什么样」，不查库、不做权限判断 —— 数据由调用方查好后传进来。
+带 callback_data 的按钮约定见各函数文档串。
+"""
+
 from __future__ import annotations
 
 from aiogram.types import (

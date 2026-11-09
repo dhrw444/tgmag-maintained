@@ -40,6 +40,7 @@ class EmailCodeRequired(Exception):
     """Telegram 要求邮箱验证码才能继续，调用方需要向用户索取 code_length 位数字。"""
 
     def __init__(self, code_length: int):
+        """把 Telegram 要求的验证码位数带在异常上，交互层据此提示用户。"""
         self.code_length = code_length
         super().__init__(f"email confirmation code required: {code_length}")
 

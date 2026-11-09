@@ -124,6 +124,12 @@ class TelegramLoginEmailCode:
 
 @dataclass(frozen=True)
 class LoginEmailWindowNotice:
+    """一条登录邮箱保护的提醒快照。
+
+    starts_new_window 区分「这条提醒开了新窗口」和「并进了已有窗口」：
+    只有前者需要调用方新建事件行并挂等待任务，后者仅仅累加 alert_count。
+    """
+
     event_id: int
     window_ends_at: datetime
     window_hours: int
@@ -330,6 +336,11 @@ class GmailCodeReader:
                 pass
 
     async def validate_connection(self) -> None:
+        """把同步的 IMAP 连接检查挪到线程里跑。
+
+        imaplib 是阻塞库，直接在事件循环里调用会卡住整个进程
+        （包括同时运行的 Telegram 更新处理），因此必须走 to_thread。
+        """
         await asyncio.to_thread(self.validate_connection_sync)
 
     def wait_for_code_sync(
@@ -421,6 +432,11 @@ class GmailCodeReader:
         requested_at: datetime,
         timeout_seconds: float | None = None,
     ) -> str:
+        """等 Gmail 收到登录验证码并返回它，超时抛 TimeoutError。
+
+        内部用 threading.Event 做取消：阻塞等待发生在工作线程里，
+        asyncio 的取消传不进去，只能靠事件让线程自己提前退出。
+        """
         cancel_event = threading.Event()
         try:
             return await asyncio.to_thread(
@@ -443,9 +459,15 @@ class TempMailCodeReader:
     已经处理过的邮件，而且限流更紧。
     """
     def __init__(self, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+        """只依赖一个 sessionmaker —— 临时邮箱的收信全走数据库表，不连 IMAP。"""
         self.sessionmaker = sessionmaker
 
     async def validate_connection(self) -> None:
+        """确认临时邮箱收信链路可用：凭据在、且能真的读一次消息表。
+
+        故意做一次真实查询而不是只看配置 —— 数据库连不上时，
+        只有到收验证码那一刻才失败的话，账号已经进了换绑流程。
+        """
         if not settings.temp_mail_webhook_secret:
             raise RuntimeError("TEMP_MAIL_WEBHOOK_SECRET is not configured")
         async with self.sessionmaker() as session:
@@ -486,6 +508,11 @@ class TempMailCodeReader:
         requested_at: datetime,
         timeout_seconds: float | None = None,
     ) -> str:
+        """轮询临时邮箱消息表，取出匹配目标邮箱的验证码。
+
+        超时时间取配置默认值或调用方显式传入值；验证码按目标邮箱过滤，
+        避免同一时间多个账号换绑时互相取到对方的码。
+        """
         timeout = (
             settings.login_email_poll_timeout_seconds
             if timeout_seconds is None
@@ -529,6 +556,12 @@ class RoutedCodeReader:
         }
 
     async def validate_connection(self) -> None:
+        """逐个检查配置里用到的后端凭据和连通性。
+
+        没有配置任何域名时直接抛错 —— 路由表为空说明换绑功能根本不可用，
+        这种状态应该在启动自检里就报出来，而不是等用户点了才失败。
+        任一后端检查失败会带上后端名和原始异常，便于直接定位。
+        """
         async with self.sessionmaker() as session:
             routes = await get_domain_backends(session)
         if not routes:
@@ -549,6 +582,11 @@ class RoutedCodeReader:
         requested_at: datetime,
         timeout_seconds: float | None = None,
     ) -> str:
+        """按目标邮箱的域名选出后端，再交给对应的 reader 去等验证码。
+
+        这里才做域名路由，是为了让「收信方式」跟着账号走：
+        同一个进程里不同账号可能用不同域名的不同收信渠道。
+        """
         try:
             _, domain = target_email.lower().rsplit("@", 1)
         except ValueError as exc:
@@ -565,6 +603,10 @@ class RoutedCodeReader:
 
 
 def normalize_domain(domain: str) -> str:
+    """把域名规整成小写、去掉前导 @；不合法直接抛 ValueError。
+
+    入库和比较都走这里，避免 "Example.COM " 和 "example.com" 被当成两个域名。
+    """
     normalized = domain.strip().lower().lstrip("@")
     if not DOMAIN_PATTERN.fullmatch(normalized):
         raise ValueError("邮箱域名格式无效")
@@ -572,6 +614,11 @@ def normalize_domain(domain: str) -> str:
 
 
 async def get_available_domains(session: AsyncSession) -> tuple[str, ...]:
+    """返回所有可用于生成换绑别名的域名。
+
+    优先读运行时设置；设置缺失或内容损坏时回落到环境变量默认值，不抛错 ——
+    因为默认值必须始终可用，否则整个换绑流程会连门都进不去。
+    """
     row = await session.get(RuntimeSetting, DOMAINS_KEY)
     if row is not None:
         try:
@@ -597,6 +644,7 @@ async def _store_available_domains(session: AsyncSession, domains: tuple[str, ..
 
 
 def email_backend_label(backend: str) -> str:
+    """把后端标识翻成界面上显示的中文名；未知标识原样返回。"""
     return EMAIL_BACKEND_LABELS.get(backend, backend)
 
 
@@ -608,6 +656,11 @@ def _fallback_domain_backend(domain: str) -> str:
 
 
 async def get_domain_backends(session: AsyncSession) -> dict[str, str]:
+    """返回 域名 → 收信后端 的路由表，每个可用域名都保证有值。
+
+    没有显式登记过的域名用 _fallback_domain_backend 兜底，所以返回值一定是
+    全量映射，调用方不需要再处理「这个域名没配后端」的情况。
+    """
     domains = await get_available_domains(session)
     stored: dict[str, str] = {}
     row = await session.get(RuntimeSetting, DOMAIN_BACKENDS_KEY)
@@ -630,6 +683,11 @@ async def get_domain_backends(session: AsyncSession) -> dict[str, str]:
 
 
 async def get_domain_backend(session: AsyncSession, domain: str) -> str:
+    """查单个域名的收信后端。
+
+    与 get_domain_backends 不同，这里域名不在允许列表时抛 ValueError ——
+    调用场景是要真的去收信，拿到一个编出来的后端只会让失败更晚更隐蔽。
+    """
     normalized = normalize_domain(domain)
     routes = await get_domain_backends(session)
     if normalized not in routes:
@@ -651,6 +709,11 @@ async def _store_domain_backends(session: AsyncSession, routes: dict[str, str]) 
 
 
 async def set_domain_backend(session: AsyncSession, domain: str, backend: str) -> None:
+    """登记域名的收信后端并提交。
+
+    域名不在允许列表、或后端凭据没配齐都抛 ValueError，并把缺哪个环境变量写进
+    消息里 —— 这是管理员在网页上最常踩的两个坑。
+    """
     normalized_domain = normalize_domain(domain)
     normalized_backend = normalize_email_backend(backend)
     if normalized_domain not in await get_available_domains(session):
@@ -673,6 +736,10 @@ async def add_available_domain(
     domain: str,
     backend: str | None = None,
 ) -> str:
+    """新增可用域名并返回规整后的域名，供调用方直接使用。
+
+    已存在或后端未配齐时抛 ValueError。backend 省略则按兜底规则推断。
+    """
     normalized = normalize_domain(domain)
     domains = await get_available_domains(session)
     if normalized in domains:
@@ -691,6 +758,11 @@ async def add_available_domain(
 
 
 async def delete_available_domain(session: AsyncSession, domain: str) -> None:
+    """删除域名，并在删掉的正好是当前默认域名时把默认值切到剩余的第一个。
+
+    不存在、或删完一个不剩都抛 ValueError —— 这里不做静默忽略：
+    「以为删掉了其实没删」比报错更难查。
+    """
     normalized = normalize_domain(domain)
     domains = await get_available_domains(session)
     if normalized not in domains:
@@ -709,6 +781,11 @@ async def delete_available_domain(session: AsyncSession, domain: str) -> None:
 
 
 async def get_selected_domain(session: AsyncSession) -> str | None:
+    """返回当前默认换绑域名；没有可用域名时返回 None。
+
+    存储值失效（比如域名已被删除）时回落到列表第一个，
+    而不是返回一个已经不存在的域名。
+    """
     domains = await get_available_domains(session)
     if not domains:
         return None
@@ -719,6 +796,7 @@ async def get_selected_domain(session: AsyncSession) -> str | None:
 
 
 async def set_selected_domain(session: AsyncSession, domain: str) -> None:
+    """设置默认换绑域名；域名不在允许列表时抛 ValueError。"""
     domain = normalize_domain(domain)
     if domain not in await get_available_domains(session):
         raise ValueError("邮箱域名不在当前允许列表中")
@@ -731,10 +809,16 @@ async def set_selected_domain(session: AsyncSession, domain: str) -> None:
 
 
 async def get_whitelist_ids(session: AsyncSession) -> set[int]:
+    """返回纳入登录邮箱保护的账号 id 集合，供调用方做差集判断。"""
     return set((await session.scalars(select(LoginEmailWhitelist.account_id))).all())
 
 
 async def set_whitelisted(session: AsyncSession, account_id: int, enabled: bool) -> None:
+    """把账号加入或移出保护白名单。
+
+    账号不存在时抛 ValueError 而不是建一条悬空白名单行；
+    重复加入和重复移除都是安全的，界面上的开关可以放心重复点。
+    """
     account = await session.get(TgAccount, account_id)
     if account is None:
         raise ValueError("账号不存在")
@@ -749,6 +833,11 @@ async def set_whitelisted(session: AsyncSession, account_id: int, enabled: bool)
 
 
 def build_alias(phone: str, domain: str, timestamp: int | None = None) -> str:
+    """按手机号和秒级时间戳拼出换绑用的邮箱别名。
+
+    时间戳参与命名是为了让同一账号多次换绑得到不同别名，
+    避免旧验证码和新请求撞进同一个收件箱而同名冲突。
+    """
     digits = "".join(character for character in phone if character.isdigit())
     if not digits:
         raise ValueError("账号手机号不可用")
@@ -773,6 +862,10 @@ class LoginEmailProtector:
         bot: Bot,
         reader: GmailCodeReader | TempMailCodeReader | RoutedCodeReader | None = None,
     ) -> None:
+        """不传 reader 时按域名路由（RoutedCodeReader），测试可注入固定 reader。
+
+        Gmail 并发信号量固定为 3：IMAP 同时开太多连接会被 Gmail 限流。
+        """
         self.sessionmaker = sessionmaker
         self.bot = bot
         self.reader = reader or RoutedCodeReader(sessionmaker)
@@ -783,10 +876,20 @@ class LoginEmailProtector:
         self._gmail_slots = asyncio.Semaphore(3)
 
     def has_window_waiter(self, event_id: int) -> bool:
+        """该事件当前是否已有活跃的窗口等待任务。
+
+        监控循环会周期性重放未完成事件，靠它避免同一事件挂上两个等待任务；
+        因此判断的是任务「还没结束」而不是「曾经登记过」。
+        """
         task = self._window_waiters.get(event_id)
         return task is not None and not task.done()
 
     def has_change_in_progress(self, account_id: int) -> bool:
+        """该账号是否正处于换绑或手动等邮件状态。
+
+        两者都算「进行中」：手动等邮件期间用户正在 Telegram 里点确认，
+        此时再发起一次换绑会和前一次抢同一个邮箱窗口。
+        """
         lock = self._change_locks.get(account_id)
         return (lock is not None and lock.locked()) or self.manual_email_wait_remaining(account_id) > 0
 
@@ -806,7 +909,11 @@ class LoginEmailProtector:
         return remaining
 
     async def cancel_account_tasks(self, account_id: int, event_ids: set[int]) -> None:
-        """Cancel protection waiters and forget per-account synchronization state."""
+        """取消这些事件的窗口等待任务，并清掉账号级的同步状态。
+
+        删号前必须调用：等待任务持着该账号的 Telegram client，
+        不取消就会在连接销毁后继续用它发消息。
+        """
         tasks = {
             task
             for event_id, task in self._window_waiters.items()
@@ -893,6 +1000,11 @@ class LoginEmailProtector:
         account_id: int,
         service_message_id: int,
     ) -> LoginEmailWindowNotice | None:
+        """记录一条提醒，返回需要处理的窗口快照；无需处理时返回 None。
+
+        先取账号级锁再进 _record_alert_locked：同一条 777000 提醒可能被多个
+        入口同时读到，没有这把锁就会重复建事件、发两条通知。
+        """
         lock = self._account_locks.setdefault(account_id, asyncio.Lock())
         async with lock:
             return await self._record_alert_locked(account_id, service_message_id)
@@ -1167,6 +1279,11 @@ class LoginEmailProtector:
         domain: str,
         client: TelegramClient,
     ) -> None:
+        """对一条失败的换绑事件重试。
+
+        域名会先规整并校验仍在允许列表内 —— 用户可能在两次尝试之间把
+        域名管理页改了，沿用旧的失效域名只会得到一串难懂的远程错误。
+        """
         domain = normalize_domain(domain)
         async with self.sessionmaker() as session:
             if domain not in await get_available_domains(session):
@@ -1235,6 +1352,12 @@ class LoginEmailProtector:
         event_id: int,
         client: TelegramClient,
     ) -> None:
+        """进程重启后接着等一条还处于 waiting_email 的事件。
+
+        换绑请求已经发往 Telegram，验证码可能已经在邮箱里，
+        所以恢复时沿用原 requested_at 计算剩余时间，而不是重新计时。
+        事件行不完整（缺目标邮箱或请求时间）时标记失败而不是静默丢弃。
+        """
         async with self.sessionmaker() as session:
             event = await session.get(LoginEmailProtectionEvent, event_id)
             if event is None or event.status != "waiting_email":

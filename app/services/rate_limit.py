@@ -68,6 +68,7 @@ class RateGate:
     """
 
     def __init__(self, rate: RateLimit):
+        """窗口起点在构造时就取好；调用方必须在事件循环内创建实例。"""
         self.rate = rate
         self._count = 0
         self._window_started = asyncio.get_event_loop().time()

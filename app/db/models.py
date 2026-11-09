@@ -105,6 +105,13 @@ class TgSession(Base):
 
 
 class AccountSecurity(Base):
+    """账号安全设置（2FA、邮箱），按账号一行。
+
+    所有秘密值都是加密列：2FA 密码、提示语、恢复邮箱、登录邮箱。
+    与 TgAccount 分成两张表是因为这些字段只被安全相关的入口读写，
+    而 TgAccount 每个列表页都会查 —— 放一起会把密文一起拖出来。
+    """
+
     __tablename__ = "account_security"
 
     account_id: Mapped[int] = mapped_column(ForeignKey("tg_accounts.id", ondelete="CASCADE"), primary_key=True)
@@ -117,6 +124,12 @@ class AccountSecurity(Base):
 
 
 class PrivacySettings(Base):
+    """账号隐私项，按账号一行以 JSON 整体存储。
+
+    用 JSON 而不是每项一列：Telegram 会新增隐私项类型，
+    拆列的话每次都要写迁移，而这里只是把 k/v 原样回传给接口。
+    """
+
     __tablename__ = "privacy_settings"
 
     account_id: Mapped[int] = mapped_column(ForeignKey("tg_accounts.id", ondelete="CASCADE"), primary_key=True)
@@ -125,6 +138,13 @@ class PrivacySettings(Base):
 
 
 class ServiceMessage(Base):
+    """来自 777000（Telegram 官方）的系统通知。
+
+    text_hash 用于跨次抓取去重：补历史消息时同一条会被反复取到，
+    靠 (account_id, source_user_id, message_id) 与 text_hash 双保险。
+    登录邮箱保护就是从这里识别 Telegram 的登录提醒。
+    """
+
     __tablename__ = "service_messages"
     __table_args__ = (UniqueConstraint("account_id", "source_user_id", "message_id", name="uq_service_account_source_message"),)
 
@@ -140,6 +160,12 @@ class ServiceMessage(Base):
 
 
 class SpamCheck(Base):
+    """一次 SpamBot 查询的结果快照。
+
+    存原始返回文本而非只存判定结果：SpamBot 文案会变，
+    保留原文才能在解析规则失准时回溯到底收到了什么。
+    """
+
     __tablename__ = "spam_checks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -150,6 +176,12 @@ class SpamCheck(Base):
 
 
 class AllowedTarget(Base):
+    """允许操作的目标（群/频道/用户）白名单。
+
+    这是防止误操作扩散的闸门：批量发消息、关注等入口先查这里。
+    (target_type, target_ref) 唯一，避免同一目标被重复登记成两种写法。
+    """
+
     __tablename__ = "allowed_targets"
     __table_args__ = (UniqueConstraint("target_type", "target_ref", name="uq_allowed_target"),)
 
@@ -162,6 +194,13 @@ class AllowedTarget(Base):
 
 
 class RateLimit(Base):
+    """按 scope 保存的操作频率上限。
+
+    约束写在数据库层（max_actions/per_seconds 必须为正、
+    jitter 区间合法）：限流参数错配会直接导致账号被 Telegram 风控，
+    这种值不该允许任何入口写进非法状态。
+    """
+
     __tablename__ = "rate_limits"
     __table_args__ = (
         CheckConstraint("max_actions > 0", name="ck_rate_max_actions_positive"),
@@ -182,6 +221,12 @@ class RateLimit(Base):
 
 
 class Job(Base):
+    """一次批量任务的头部记录。
+
+    params_json 原样保存发起时的入参，使得任务失败后能复现，
+    也避免因为运行时设置被改动而无法解释历史任务的行为。
+    """
+
     __tablename__ = "jobs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -194,6 +239,12 @@ class Job(Base):
 
 
 class JobItem(Base):
+    """批量任务里针对单个账号/目标的一条执行记录。
+
+    account_id 用 SET NULL 而不是级联删除：账号被删后这条历史仍要留下来，
+    否则无法回答「那次批量到底动了哪些账号」。
+    """
+
     __tablename__ = "job_items"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -206,6 +257,13 @@ class JobItem(Base):
 
 
 class AuditLog(Base):
+    """管理操作审计。
+
+    admin_id 用 SET NULL：管理员被移除后审计记录不能跟着消失，
+    否则一次误删就清掉了他做过的全部操作痕迹。
+    payload_json 保留当时的完整入参，用于事后核对。
+    """
+
     __tablename__ = "audit_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -218,6 +276,13 @@ class AuditLog(Base):
 
 
 class RuntimeSetting(Base):
+    """可在运行时改动的设置，键值均以字符串存储。
+
+    与 .env 的分工：.env 是部署期不变的基础设施参数，
+    这里是运维过程中会调的项（域名、窗口时长、白名单等）。
+    值是字符串所以调用方必须自己校验并兜住非法历史值。
+    """
+
     __tablename__ = "runtime_settings"
 
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -228,6 +293,12 @@ class RuntimeSetting(Base):
 
 
 class LoginEmailWhitelist(Base):
+    """登录邮箱保护的白名单账号：只转发提醒，不自动换绑。
+
+    独立成表而不是在 TgAccount 上加布尔列 —— 白名单是运营侧的例外清单，
+    存在与否就是全部语义，单独的表让增删都能被审计。
+    """
+
     __tablename__ = "login_email_whitelist"
 
     account_id: Mapped[int] = mapped_column(
@@ -237,6 +308,16 @@ class LoginEmailWhitelist(Base):
 
 
 class LoginEmailProtectionEvent(Base):
+    """一次登录邮箱保护的全过程状态机。
+
+    status 取值由 app/services/login_email_protection.py 定义
+    （waiting_window / waiting_email / requesting / confirmed / failed 等）。
+    service_message_id 唯一：同一条 Telegram 提醒只能驱动一个事件，
+    否则监控循环重放历史消息会重复发起换绑。
+    parent_event_id 让窗口期内的后续提醒挂到首个事件上，
+    而不是各自开一条换绑流程。
+    """
+
     __tablename__ = "login_email_protection_events"
     __table_args__ = (
         UniqueConstraint("service_message_id", name="uq_login_email_event_message"),
@@ -272,6 +353,13 @@ class LoginEmailProtectionEvent(Base):
 
 
 class TempMailMessage(Base):
+    """Cloudflare 临时邮箱收到的邮件，是验证码的读取来源。
+
+    字段名与上游 Webhook 的 JSON 对齐（to/from/parsedText 等），
+    部分保留驼峰列名，改列名会让入库映射和上游响应对不上。
+    主键是 (id, to)：上游的 id 在收件人之间不唯一。
+    """
+
     __tablename__ = "temp_mail_messages"
     __table_args__ = (
         Index("ix_temp_mail_recipient_received", "to", "received_at"),

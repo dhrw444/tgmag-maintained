@@ -183,11 +183,19 @@ class Settings(BaseSettings):
     @field_validator("login_email_gmail_username")
     @classmethod
     def normalize_gmail_username(cls, value: str) -> str:
+        """Gmail 用户名统一成小写去空白：IMAP 登录区分大小写，
+        而用户从邮箱设置页复制出来的往往带空格或首字母大写。
+        """
         return value.strip().lower()
 
     @field_validator("login_email_gmail_app_password")
     @classmethod
     def normalize_gmail_app_password(cls, value: str) -> str:
+        """去掉应用专用密码里的全部空白。
+
+        Google 界面上按 xxxx xxxx xxxx xxxx 分组显示，直接粘贴会带空格，
+        而 IMAP 只接受连续 16 位，因此照抄就会登录失败。
+        """
         # Gmail 应用专用密码显示时带空格（xxxx xxxx xxxx xxxx），
         # 复制粘贴进来会带空格，IMAP 登录不接受，这里统一去掉所有空白。
         return "".join(value.split())
@@ -262,10 +270,16 @@ class Settings(BaseSettings):
 
     @cached_property
     def login_email_alias_domains(self) -> tuple[str, ...]:
+        """环境变量里配置的邮箱域名列表，按逗号切分并丢掉空项。
+
+        这是运行时设置缺失时的兜底来源；用它缓存结果是因为
+        每次换绑都会问到，而环境变量本身不会变。
+        """
         return tuple(item for item in self.login_email_alias_domains_raw.split(",") if item)
 
     @property
     def login_email_domain_backends(self) -> dict[str, str]:
+        """环境变量里配置的 域名→后端 映射，同样是运行时设置的兜底。"""
         return parse_domain_backends(self.login_email_domain_backends_raw)
 
     @property
