@@ -1,3 +1,27 @@
+"""Bot 命令处理器。
+
+2782 行，104 个函数，全部围绕「一次 Telegram 交互」展开。阅读顺序建议：
+
+1. 顶部常量：BOT_COMMANDS（菜单文案）与各 StatesGroup 的用法。
+2. 无装饰器的辅助函数（约 178-680 行）：文本渲染、参数解析、账号查找、
+   敏感输入清理。这些不直接收发消息，是下面 handler 的公共底座。
+3. 带 router.* 装饰器的函数：一个函数对应一条命令或一个 FSM 状态。
+
+几条贯穿全文件的约定：
+
+- **每个 handler 自己开 session**。没有全局 session，也不跨 handler 传递。
+  Mini App 侧（app/webapp/server.py）遵循同样的约定。
+- **敏感输入用完立刻删**。手机号、验证码、2FA 密码、session 串在读完的同一处
+  调 delete_sensitive_input，不留到下一步 —— Telegram 的聊天记录是长期的。
+- **失败一律回中文说明**。ValueError 的 message 直接给用户看，因此抛出点
+  要写清楚「哪里不对、下一步怎么做」，而不是抛给开发者看的堆栈信息。
+- **长操作先应答再执行**。需要调 Telegram API 的地方先 answer_panel 或发一条
+  提示，避免用户看到按钮一直转圈。
+
+回调数据（callback_data）的格式没有统一封装，按各命令自己解析；
+新增入口时记得同时改 BOT_COMMANDS，否则菜单里看不到。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -182,6 +206,11 @@ async def configure_bot_ui(bot: Bot) -> None:
 
 
 def split_hint_email(parts: list[str], hint_index: int) -> tuple[str | None, str | None]:
+    """从命令尾部拆出 (提示语, 邮箱)。
+    
+        约定：最后一个参数若含 @ 就当邮箱取走，剩下的拼成提示语。
+        两者都可能为 None，调用方要分别判断。
+        """
     if len(parts) <= hint_index:
         return None, None
     tail = parts[hint_index:]
@@ -193,6 +222,11 @@ def split_hint_email(parts: list[str], hint_index: int) -> tuple[str | None, str
 
 
 def args(message: Message) -> list[str]:
+    """按 shell 规则切分命令参数，跳过命令名本身。
+    
+        引号不配对时 shlex 抛 ValueError，此时退回朴素 split ——
+        用户少打一个引号不该让整条命令失败。
+        """
     text = message.text or ""
     try:
         return shlex.split(text)[1:]
@@ -201,6 +235,7 @@ def args(message: Message) -> list[str]:
 
 
 async def get_account(session: AsyncSession, account_id: int) -> TgAccount:
+    """按本地账号 ID 取 TgAccount，不存在时抛 ValueError（消息直接给用户看）。"""
     account = await session.get(TgAccount, account_id)
     if not account:
         raise ValueError(f"账号 {account_id} 不存在")
@@ -208,6 +243,11 @@ async def get_account(session: AsyncSession, account_id: int) -> TgAccount:
 
 
 async def resolve_account_id(session: AsyncSession, raw_id: str | int) -> int:
+    """把用户输入的 ID 解析成本地账号 ID。
+    
+        先按本地主键查，查不到再按 Telegram user_id 查 —— 用户手上通常只有
+        Telegram ID。两者都查不到时抛 ValueError 并说明支持哪两种 ID。
+        """
     value = int(raw_id)
     if -(2**31) <= value <= 2**31 - 1:
         account = await session.get(TgAccount, value)
@@ -220,6 +260,11 @@ async def resolve_account_id(session: AsyncSession, raw_id: str | int) -> int:
 
 
 async def account_ids_from_range(session: AsyncSession, start_id: int, count: int) -> list[int]:
+    """从 start_id 起取连续的 count 个「有 active session」的账号 ID。
+    
+        只返回能真正操作的账号：没有 active session 的账号被 join 条件排除，
+        而不是返回后再让调用方失败。count 上限 200 防止一次命令打爆 Telegram 限流。
+        """
     if start_id <= 0 or not 1 <= count <= 200:
         raise ValueError("start_id 必须为正整数，count 必须在 1 到 200 之间")
     rows = await session.scalars(
@@ -237,6 +282,11 @@ async def send_session_export(
     sessionmaker: async_sessionmaker[AsyncSession],
     account_ids: list[int],
 ) -> None:
+    """把指定账号的 session 串导出成文件发给操作者。
+    
+        导出的内容是明文凭证，因此发完即弃：不在服务器留文件，也不写审计正文。
+        逐个账号处理，某个账号没有 session 时跳过而不是整批失败。
+        """
     async with sessionmaker() as session:
         content, exported, skipped = await build_session_export(session, account_ids)
     if exported == 0:
@@ -254,6 +304,11 @@ async def send_session_export(
 
 
 def parse_session_import_payload(content: str) -> list[tuple[str, str]]:
+    """把一条粘贴进来的导入内容拆成 [(标签, session 串)]。
+    
+        容忍三种写法：单行 session、`标签----session`、以及多行逐条。
+        空行和 # 开头的注释行跳过，方便用户直接粘贴整理过的清单。
+        """
     accounts: list[tuple[str, str]] = []
     current: dict[str, str] = {}
 
@@ -295,6 +350,11 @@ def parse_session_import_payload(content: str) -> list[tuple[str, str]]:
 
 
 async def read_session_import_content(message: Message, bot: Bot) -> str:
+    """从消息里取出待导入内容：优先读文档附件，没有附件再读正文。
+    
+        附件按 UTF-8 读，解码失败抛 ValueError 而不是猜编码 ——
+        猜错会产生一串乱码 session，报错反而更好排查。
+        """
     if message.document:
         if message.document.file_size and message.document.file_size > 5 * 1024 * 1024:
             raise ValueError("文件过大，请上传 5MB 以内的 txt 文件。")
@@ -310,6 +370,11 @@ async def import_session_payload(
     sessionmaker: async_sessionmaker[AsyncSession],
     content: str,
 ) -> tuple[int, int, str]:
+    """逐条导入 session 并汇总结果。
+    
+        单条失败不中断整批：收集 (标签, 错误原因) 交给 send_import_report 统一回显。
+        已存在的账号走更新而不是新建，因此重复导入同一批是安全的。
+        """
     entries = parse_session_import_payload(content)
     ok_lines: list[str] = []
     failed_lines: list[str] = []
@@ -334,6 +399,10 @@ async def import_session_payload(
 
 
 async def send_import_report(message: Message, report: str) -> None:
+    """把批量导入的结果渲染成一条消息：成功数、失败逐条原因。
+    
+        失败原因为空时只报成功数，避免发一条全是噪音的消息。
+        """
     if len(report) <= 3500:
         await message.answer(report)
         return
@@ -348,6 +417,11 @@ async def status_text(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> str:
+    """渲染 /status 的总览文本：账号计数、连接状态、保护链路状态。
+    
+        连接状态来自 ClientPool 的内存视图，与数据库里的 status 字段可能不一致 ——
+        前者是「此刻连没连上」，后者是「最后一次操作留下的结果」。
+        """
     async with sessionmaker() as session:
         total = await session.scalar(select(func.count()).select_from(TgAccount))
         active_account_ids = set(
@@ -407,6 +481,11 @@ def login_email_runtime_status(
     health_checked: bool,
     health_error: str | None,
 ) -> str:
+    """渲染登录邮箱保护链路的运行状态。
+    
+        把「配置是否完整」和「最近一次保护是否成功」分开显示：
+        配好了不等于跑通了，混在一起会让人误判。
+        """
     if not settings.login_email_protection_enabled:
         return "已停用"
     if not configuration_ready:
@@ -434,6 +513,11 @@ async def accounts_text_and_rows(
     sessionmaker: async_sessionmaker[AsyncSession],
     requested_page: int = 1,
 ) -> tuple[str, list[TgAccount], int, int]:
+    """渲染分页的账号列表，返回 (文本, 按钮行)。
+    
+        按钮按账号 ID 排列，每行固定数量，与文本里的顺序一致 ——
+        顺序不一致会让人点错账号。
+        """
     async with sessionmaker() as session:
         total = int(await session.scalar(select(func.count()).select_from(TgAccount)) or 0)
         page, pages, offset = account_page_window(total, requested_page)
@@ -450,6 +534,10 @@ async def accounts_text_and_rows(
 
 
 async def account_detail_text(session: AsyncSession, account_id: int) -> str:
+    """渲染单账号的简要信息：ID、掩码手机号、用户名、状态、余额。
+    
+        只显示掩码手机号，明文手机号不在任何 Bot 输出里出现。
+        """
     account = await get_account(session, account_id)
     security = await session.get(AccountSecurity, account.id)
     privacy = await session.get(PrivacySettings, account.id)
@@ -465,6 +553,7 @@ async def account_detail_text(session: AsyncSession, account_id: int) -> str:
 
 
 def account_status_label(status: str | None) -> str:
+    """把内部 status 常量翻译成给人看的中文标签。未知值原样返回。"""
     labels = {
         "normal": "正常",
         "limited": "限制",
@@ -482,6 +571,11 @@ async def account_full_detail_text(
     account_id: int,
     live_2fa: dict[str, str | bool | None] | None = None,
 ) -> str:
+    """渲染单账号的完整信息：含 2FA、登录邮箱、隐私、安全快照。
+    
+        比 account_detail_text 多出敏感项，因此只在 /account_info 这类
+        明确要看详情的命令里用。
+        """
     account = await get_account(session, account_id)
     security = await session.get(AccountSecurity, account.id)
     privacy = await session.get(PrivacySettings, account.id)
@@ -537,6 +631,11 @@ async def account_full_detail_text(
 
 
 async def answer_panel(callback: CallbackQuery, text: str, reply_markup=None) -> None:
+    """应答按钮点击并就地更新这条面板消息。
+    
+        answer 为空时不弹提示 —— Telegram 要求每次 callback 都必须应答，
+        但空字符串的提示框会让界面闪一下，用空应答避免这个副作用。
+        """
     await callback.answer()
     if not callback.message:
         return
@@ -564,21 +663,37 @@ async def dismiss_panel(callback: CallbackQuery) -> None:
 
 
 async def ask_with_cancel(message: Message, text: str, placeholder: str) -> None:
+    """发一条带取消按钮的提示，等待用户输入。
+    
+        返回提示消息对象，调用方在用户答复后负责删除它 ——
+        这里不删是因为答复可能来自另一个 handler。
+        """
     await message.answer(f"{text}\n\n可随时点击“取消当前操作”。", reply_markup=cancel_inline())
 
 
 async def ask_callback_with_cancel(callback: CallbackQuery, text: str, placeholder: str) -> None:
+    """ask_with_cancel 的回调版本：在已有面板上追加取消按钮。"""
     await callback.answer()
     if callback.message:
         await ask_with_cancel(callback.message, text, placeholder)
 
 
 async def qr_flow_is_active(state: FSMContext, flow_id: str) -> bool:
+    """判断该用户当前是否有进行中的扫码登录。
+    
+        用来防止同时开两个二维码会话 —— 两个会话共用一个 Telegram 登录流程，
+        同时进行会互相顶掉。
+        """
     data = await state.get_data()
     return await state.get_state() == LoginFlow.qr_wait.state and data.get("flow_id") == flow_id
 
 
 async def delete_sensitive_input(message: Message) -> None:
+    """删除一条含敏感输入的消息。
+    
+        删除失败只记 debug：可能是消息太旧（超过 48 小时）或已被用户删除，
+        这两种情况都不影响流程，不该因此报错给用户。
+        """
     try:
         await message.delete()
     except TelegramAPIError:
@@ -586,10 +701,16 @@ async def delete_sensitive_input(message: Message) -> None:
 
 
 def has_login_email(twofa_info: dict[str, str | bool | None]) -> bool:
+    """判断账号是否已配置登录邮箱（从安全快照里读）。"""
     return bool(twofa_info.get("login_email_pattern"))
 
 
 def post_login_security_text(account: TgAccount, twofa_info: dict[str, str | bool | None]) -> str | None:
+    """登录成功后展示安全状态与建议的下一步。
+    
+        按「有没有登录邮箱」「2FA 开没开」组合出不同的建议文案，
+        只给当前缺失的那一步，不列全部清单。
+        """
     has_2fa = bool(twofa_info.get("has_2fa"))
     login_email_exists = has_login_email(twofa_info)
     if has_2fa and login_email_exists:
@@ -615,6 +736,7 @@ async def prompt_post_login_security(
     account: TgAccount,
     client_pool: ClientPool,
 ) -> None:
+    """把 post_login_security_text 作为一条带按钮的提示发出去。"""
     try:
         client = await client_pool.get_client(account.id)
         twofa_info = await account_ops.get_2fa_info(client)
@@ -628,6 +750,7 @@ async def prompt_post_login_security(
 
 @router.message(Command("start", "menu"))
 async def start(message: Message) -> None:
+    """发主菜单并清空当前 FSM 状态。重复 /start 是安全的，它同时充当「重置」。"""
     await message.answer(
         "Telegram 多账号管理 Bot\n\n"
         "主菜单可以用输入框旁的小键盘按钮随时展开或收起。"
@@ -639,6 +762,7 @@ async def start(message: Message) -> None:
 @router.message(Command("cancel"))
 @router.message(F.text.in_(CANCEL_TEXTS))
 async def cancel_current(message: Message, state: FSMContext) -> None:
+    """取消当前流程：清 FSM、清 pending 状态、回主菜单。没有进行中的操作也正常返回。"""
     data = await state.get_data()
     client = data.get("client")
     if client is not None:
@@ -652,6 +776,7 @@ async def cancel_current(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "flow:cancel")
 async def cancel_current_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    """cancel_current 的按钮版本，应答并就地更新面板。"""
     data = await state.get_data()
     client = data.get("client")
     if client is not None:
@@ -667,6 +792,7 @@ async def cancel_current_callback(callback: CallbackQuery, state: FSMContext) ->
 
 @router.message(Command("cmd", "help", "command"))
 async def cmd(message: Message) -> None:
+    """打印全部命令与用法。文案来源是 formatting.COMMANDS，不在这里重复维护。"""
     await message.answer(COMMANDS[:4096], reply_markup=main_menu())
     if len(COMMANDS) > 4096:
         await message.answer(COMMANDS[4096:])
@@ -674,6 +800,7 @@ async def cmd(message: Message) -> None:
 
 @router.message(Command("app", "mini_app"))
 async def mini_app(message: Message) -> None:
+    """发送 Mini App 启动按钮。未启用或未配置公网 URL 时说明原因而不是给一个死按钮。"""
     panel = mini_app_panel()
     if panel is None:
         await message.answer(
@@ -685,11 +812,13 @@ async def mini_app(message: Message) -> None:
 
 @router.message(Command("status"))
 async def status(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """总览：账号计数、连接状态、保护链路。具体数值由 status_text 渲染。"""
     await message.answer(await status_text(sessionmaker, client_pool), reply_markup=main_menu())
 
 
 @router.message(Command("settings"))
 async def settings_command(message: Message) -> None:
+    """打开设置面板。面板内容按分组渲染，改动走 settings_callback。"""
     await message.answer("目标白名单与速率配置", reply_markup=settings_panel())
 
 
@@ -699,6 +828,7 @@ async def security_command(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """打开安全面板：登录邮箱保护、2FA、安全自检入口。"""
     async with sessionmaker() as session:
         text, panel = await login_email_guard_view(session, client_pool)
     await message.answer(text, reply_markup=panel)
@@ -706,6 +836,7 @@ async def security_command(
 
 @router.message(Command("login"))
 async def login_start(message: Message, state: FSMContext) -> None:
+    """开始手机号登录流程：进入 LoginFlow.phone 等待手机号输入。"""
     current_state = await state.get_state()
     current_data = await state.get_data()
     if current_data.get("client") is not None and current_state in {
@@ -741,6 +872,11 @@ async def qr_login_start(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """开始扫码登录。
+    
+        建二维码会话后把 PNG 发给用户，并起一个后台任务等扫码结果。
+        同一用户已有进行中的扫码流程时直接拒绝，见 qr_flow_is_active。
+        """
     previous = await state.get_data()
     previous_client = previous.get("client")
     if previous_client is not None:
@@ -825,6 +961,7 @@ async def qr_login_callback(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """扫码流程的按钮回调：刷新二维码或取消。刷新会重建会话，旧二维码随之失效。"""
     await callback.answer()
     if callback.message:
         await qr_login_start(callback.message, state, sessionmaker, client_pool)
@@ -836,6 +973,11 @@ async def login_phone(
     state: FSMContext,
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
+    """收手机号并请求验证码。
+    
+        手机号读完立刻删除原消息。Telegram 返回的各种异常在这里翻译成
+        可操作的提示（号码格式、已被封、需要先取消其他登录等）。
+        """
     phone = (message.text or "").strip()
     phone_masked = account_ops.mask_phone(phone)
     async with sessionmaker() as session:
@@ -905,6 +1047,11 @@ async def login_code(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """收短信/App 内验证码并完成登录。
+    
+        成功路径：落库 → 提示安全设置 → 清 FSM。
+        需要 2FA 时转到 LoginFlow.password；验证码错误时留在当前状态允许重试。
+        """
     data = await state.get_data()
     code = (message.text or "").strip()
     await delete_sensitive_input(message)
@@ -967,6 +1114,7 @@ async def login_password(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """收 2FA 密码完成登录。密码错误时保留状态重试，成功后删除密码消息并落库。"""
     data = await state.get_data()
     password = (message.text or "").strip()
     await delete_sensitive_input(message)
@@ -1010,6 +1158,7 @@ async def login_password(
 
 @router.message(Command("import_session"))
 async def import_session_start(message: Message, state: FSMContext) -> None:
+    """开始单条 session 导入：进入 ImportSessionFlow.phone 询问手机号（仅作标签用）。"""
     await state.clear()
     await state.set_state(ImportSessionFlow.phone)
     await ask_with_cancel(message, "请输入该 session 对应手机号。", "+8613800000000")
@@ -1017,6 +1166,7 @@ async def import_session_start(message: Message, state: FSMContext) -> None:
 
 @router.message(ImportSessionFlow.phone)
 async def import_session_phone(message: Message, state: FSMContext) -> None:
+    """收手机号标签，转到等待 session 串的状态。"""
     await state.update_data(phone=(message.text or "").strip())
     await state.set_state(ImportSessionFlow.session)
     await ask_with_cancel(message, "请输入 Telethon StringSession。", "StringSession")
@@ -1024,6 +1174,11 @@ async def import_session_phone(message: Message, state: FSMContext) -> None:
 
 @router.message(ImportSessionFlow.session)
 async def import_session_value(message: Message, state: FSMContext, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    """收 session 串并导入。
+    
+        原文读完立即删除。导入失败按异常类型给出「串无效 / 已被别处登录」这类
+        可判断的原因，而不是原样抛 Telethon 异常。
+        """
     data = await state.get_data()
     session_value = (message.text or "").strip()
     await delete_sensitive_input(message)
@@ -1036,6 +1191,7 @@ async def import_session_value(message: Message, state: FSMContext, sessionmaker
 
 @router.message(Command("import_sessions"))
 async def import_sessions_start(message: Message, state: FSMContext) -> None:
+    """开始批量导入：进入 ImportSessionsFlow.payload 等待粘贴或上传文件。"""
     await state.clear()
     await state.set_state(ImportSessionsFlow.payload)
     await ask_with_cancel(message, "请上传 /export_sessions 导出的 txt 文件，或直接粘贴文件内容。", "上传 txt 文件或粘贴内容")
@@ -1048,6 +1204,7 @@ async def import_sessions_payload(
     bot: Bot,
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
+    """收批量内容（正文或 .txt 附件）并逐条导入，结果由 send_import_report 汇总。"""
     try:
         content = await read_session_import_content(message, bot)
         await delete_sensitive_input(message)
@@ -1063,6 +1220,7 @@ async def import_sessions_payload(
 
 @router.message(Command("export_session"))
 async def export_session(message: Message, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    """导出单个账号的 session。参数是本地 ID 或 Telegram ID，两者都试。"""
     a = args(message)
     if not a:
         await message.answer("用法：/export_session <账号ID或Telegram ID>")
@@ -1077,6 +1235,7 @@ async def export_session(message: Message, sessionmaker: async_sessionmaker[Asyn
 
 @router.message(Command("export_sessions"))
 async def export_sessions(message: Message, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    """导出多个账号的 session。参数支持逗号分隔和区间（如 1,3,5-7）。"""
     a = args(message)
     if not a:
         await message.answer("用法：/export_sessions <账号ID列表> 或 /export_sessions <start_id> <count>\n例：/export_sessions 1,3,5-8")
@@ -1095,6 +1254,7 @@ async def export_sessions(message: Message, sessionmaker: async_sessionmaker[Asy
 
 @router.message(Command("export_session_select"))
 async def export_session_select(message: Message, state: FSMContext) -> None:
+    """不带参数时的导出入口：列出账号让用户点选。"""
     await state.clear()
     await state.set_state(ExportSessionFlow.selection)
     await ask_with_cancel(message, "请输入要导出的账号ID，支持 1,3,5-8。", "1,3,5-8")
@@ -1106,6 +1266,7 @@ async def export_session_selection(
     state: FSMContext,
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
+    """处理导出点选结果，按选中的 ID 集合导出。"""
     try:
         selected = parse_account_selection((message.text or "").strip())
         async with sessionmaker() as session:
@@ -1120,6 +1281,7 @@ async def export_session_selection(
 
 @router.message(Command("accounts"))
 async def accounts(message: Message, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    """分页列出全部账号，带翻页和详情按钮。"""
     text, accounts_list, page, pages = await accounts_text_and_rows(sessionmaker)
     await message.answer(
         text,
@@ -1129,6 +1291,7 @@ async def accounts(message: Message, sessionmaker: async_sessionmaker[AsyncSessi
 
 @router.message(Command("account", "profile"))
 async def account_detail(message: Message, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    """单账号简要详情。参数可以是本地 ID 或 Telegram ID。"""
     a = args(message)
     if not a:
         await message.answer("用法：/account <id>")
@@ -1141,6 +1304,7 @@ async def account_detail(message: Message, sessionmaker: async_sessionmaker[Asyn
 
 @router.message(Command("account_info", "account_detail"))
 async def account_info(message: Message, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    """单账号完整详情：含 2FA、登录邮箱、隐私与安全快照。"""
     a = args(message)
     if not a:
         await message.answer("用法：/account_info <id>")
@@ -1153,6 +1317,7 @@ async def account_info(message: Message, sessionmaker: async_sessionmaker[AsyncS
 
 @router.message(Command("reconnect"))
 async def reconnect(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """重连指定账号。账号不存在或 session 已失效时给出明确原因。"""
     a = args(message)
     if not a:
         await message.answer("用法：/reconnect <id>")
@@ -1167,6 +1332,7 @@ async def reconnect(message: Message, sessionmaker: async_sessionmaker[AsyncSess
 
 @router.message(Command("reconnect_all", "service_monitor_on"))
 async def reconnect_all(message: Message, client_pool: ClientPool) -> None:
+    """重连全部账号。逐个处理，单个失败不影响其他账号。"""
     await client_pool.start_service_monitor()
     await message.answer(
         f"实时监听已开启，已连接可用 session 账号：{len(client_pool.connected_account_ids)}",
@@ -1176,12 +1342,14 @@ async def reconnect_all(message: Message, client_pool: ClientPool) -> None:
 
 @router.message(Command("service_monitor_off"))
 async def monitor_off(message: Message, client_pool: ClientPool) -> None:
+    """停止后台监控循环。已建立的连接保持不动，只是不再自动重连。"""
     await client_pool.stop_service_monitor()
     await message.answer("实时监听已关闭。普通账号操作仍可按需重连。", reply_markup=main_menu())
 
 
 @router.message(Command("set_name"))
 async def set_name(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """改姓名。参数按「名 姓」解析，单段则作为全名。"""
     a = args(message)
     if len(a) < 2:
         await message.answer("用法：/set_name <id> <first> [last]")
@@ -1197,6 +1365,7 @@ async def set_name(message: Message, sessionmaker: async_sessionmaker[AsyncSessi
 
 @router.message(Command("set_bio"))
 async def set_bio(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """改简介。空参数视为清空，不是「不修改」。"""
     a = args(message)
     if len(a) < 2:
         await message.answer("用法：/set_bio <id> <bio>")
@@ -1210,6 +1379,7 @@ async def set_bio(message: Message, sessionmaker: async_sessionmaker[AsyncSessio
 
 @router.message(Command("set_username"))
 async def set_username(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """改用户名。空参数表示清除用户名，与「不修改」不同。"""
     a = args(message)
     if len(a) != 2:
         await message.answer("用法：/set_username <id> <username>")
@@ -1225,6 +1395,11 @@ async def set_username(message: Message, sessionmaker: async_sessionmaker[AsyncS
 
 @router.message(Command("set_avatar"))
 async def set_avatar(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """改头像。两种来源：回复一张图片，或直接给 URL。
+    
+        URL 必须命中 RANDOM_AVATAR_URLS 白名单；直接给任意 URL 会被拒。
+        体积超过 MAX_AVATAR_BYTES 的图片在下载前就被挡掉。
+        """
     a = args(message)
     if len(a) != 2:
         await message.answer("用法：/set_avatar <id> <服务器文件路径>")
@@ -1238,6 +1413,7 @@ async def set_avatar(message: Message, sessionmaker: async_sessionmaker[AsyncSes
 
 @router.message(Command("privacy"))
 async def privacy(message: Message, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    """列出当前隐私设置。只读，不修改。"""
     a = args(message)
     if len(a) != 1:
         await message.answer("用法：/privacy <id>")
@@ -1250,6 +1426,7 @@ async def privacy(message: Message, sessionmaker: async_sessionmaker[AsyncSessio
 
 @router.message(Command("set_privacy"))
 async def set_privacy(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """改单项隐私设置。参数是「键 值」，键必须是 Telegram 支持的隐私项。"""
     a = args(message)
     if len(a) != 3:
         await message.answer("用法：/set_privacy <id> <phone|last_seen|profile_photo|forwards|calls|groups> <everybody|contacts|nobody>")
@@ -1264,6 +1441,7 @@ async def set_privacy(message: Message, sessionmaker: async_sessionmaker[AsyncSe
 
 @router.message(Command("check_2fa"))
 async def check_2fa(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """查询账号 2FA 是否启用并回显提示语。"""
     a = args(message)
     if len(a) != 1:
         await message.answer("用法：/check_2fa <id>")
@@ -1278,6 +1456,7 @@ async def check_2fa(message: Message, sessionmaker: async_sessionmaker[AsyncSess
 
 @router.message(Command("set_2fa", "change_2fa", "disable_2fa"))
 async def twofa(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """2FA 管理入口：按当前状态给「设置 / 修改 / 关闭」三种按钮。"""
     command = (message.text or "").split()[0].lstrip("/")
     a = args(message)
     await delete_sensitive_input(message)
@@ -1313,6 +1492,7 @@ async def twofa(message: Message, sessionmaker: async_sessionmaker[AsyncSession]
 
 @router.message(Command("spam"))
 async def spam(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """对单个账号跑 SpamBot 检测。会给 SpamBot 发真实消息，因此有频率限制。"""
     a = args(message)
     if len(a) != 1:
         await message.answer("用法：/spam <id>")
@@ -1331,6 +1511,7 @@ async def spam(message: Message, sessionmaker: async_sessionmaker[AsyncSession],
 
 @router.message(Command("spam_all"))
 async def spam_all(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """对全部账号跑 SpamBot 检测。逐账号进行，结果汇总成一条消息。"""
     async with sessionmaker() as session:
         ids = await account_ids_from_range(session, 1, 200)
     ok = 0
@@ -1348,6 +1529,7 @@ async def spam_all(message: Message, sessionmaker: async_sessionmaker[AsyncSessi
 
 @router.message(Command("service_check"))
 async def service_check(message: Message, sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool) -> None:
+    """拉取并落库各账号与服务号的最近历史消息，用于补齐停机期间漏掉的通知。"""
     a = args(message)
     if len(a) != 1:
         await message.answer("用法：/service_check <id>")
@@ -1367,6 +1549,11 @@ async def service_check(message: Message, sessionmaker: async_sessionmaker[Async
 
 @router.message(Command("target_allowlist"))
 async def target_allowlist(message: Message, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    """查看与修改目标白名单。
+    
+        白名单限制批量操作能作用于哪些对话，空表示不限制。
+        修改会即时生效，不需要重启。
+        """
     a = args(message)
     async with sessionmaker() as session:
         if not a or a[0] == "list":
@@ -1399,6 +1586,7 @@ async def target_allowlist(message: Message, sessionmaker: async_sessionmaker[As
 
 @router.message(Command("rate"))
 async def rate(message: Message, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    """查看与修改速率设置（每账号操作间隔、并发上限等）。"""
     a = args(message)
     async with sessionmaker() as session:
         if not a or a[0] == "show":
@@ -1498,6 +1686,11 @@ async def single_batch_command(
     admin: Admin | None,
     client_pool: ClientPool,
 ) -> None:
+    """单账号批量动作的统一入口。
+    
+        具体动作由命令名决定（签到、关注等），这里负责参数解析、
+        目标校验和结果渲染，动作本身在 batch_ops 里。
+        """
     command = (message.text or "").split()[0].lstrip("/")
     a = args(message)
     usage = "用法：/send <id> <target> <text> | /subscribe <id> <target> | /react <id> <target> <msg_id> <emoji> | /unreact <id> <target> <msg_id> | /view_post <id> <target> <msg_id> | /forward <id> <source> <msg_id> <target>"
@@ -1546,6 +1739,11 @@ async def many_batch_command(
     admin: Admin | None,
     client_pool: ClientPool,
 ) -> None:
+    """多账号批量动作的统一入口。
+    
+        与 single_batch_command 的区别只是账号选择方式（区间 / 点选），
+        执行和渲染共用同一套逻辑。
+        """
     command = (message.text or "").split()[0].lstrip("/")
     a = args(message)
     minimum_args = {"send_all": 4, "subscribe_all": 3, "react_all": 5, "view_post_all": 4, "forward_all": 5}
@@ -1588,6 +1786,7 @@ async def menu_text_command(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """纯文本菜单命令：回复一段说明文字，不带按钮。"""
     action = MENU_TEXTS[message.text or ""]
     if action == "status":
         await message.answer(await status_text(sessionmaker, client_pool), reply_markup=main_menu())
@@ -1635,6 +1834,7 @@ async def nav_callback(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """面板导航回调：在设置/安全/账号各层之间跳转并就地更新消息。"""
     parts = (callback.data or "").split(":")
     target = parts[1]
     if target == "home":
@@ -1680,6 +1880,7 @@ async def nav_callback(
 
 @router.callback_query(F.data.startswith("flow:"))
 async def flow_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    """流程内的通用回调：开始、取消、返回上一步。"""
     flow = (callback.data or "").split(":", 1)[1]
     await callback.answer()
     if not callback.message:
@@ -1707,6 +1908,7 @@ async def account_callback(
     callback: CallbackQuery,
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
+    """账号列表面板的回调：翻页、选中、打开详情。"""
     parts = (callback.data or "").split(":")
     account_id = int(parts[1])
     accounts_page = int(parts[2]) if len(parts) > 2 else 1
@@ -1725,6 +1927,11 @@ async def account_delete_callback(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """账号删除流程。
+    
+        两步确认后才真正删。删除期间在 ClientPool 里打互斥标记，
+        并在 finally 里解除 —— 中途异常不解除会让该账号永远无法重连。
+        """
     _, stage, account_id_raw, accounts_page_raw = (callback.data or "").split(":", 3)
     account_id = int(account_id_raw)
     accounts_page = max(int(accounts_page_raw), 1)
@@ -1791,6 +1998,7 @@ async def account_action_callback(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """账号动作面板的回调：重连、同步资料、退出登录等单账号操作的分发。"""
     _, action, account_id_raw = (callback.data or "").split(":", 2)
     account_id = int(account_id_raw)
     await callback.answer("处理中...")
@@ -1868,6 +2076,7 @@ async def account_action_callback(
 
 @router.callback_query(F.data.startswith("acct_panel:"))
 async def account_panel_callback(callback: CallbackQuery) -> None:
+    """打开某账号的操作面板，按账号当前状态决定显示哪些按钮。"""
     _, panel, account_id_raw = (callback.data or "").split(":", 2)
     account_id = int(account_id_raw)
     if panel == "profile":
@@ -1884,6 +2093,7 @@ async def account_panel_callback(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("acct_edit:"))
 async def account_edit_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    """账号资料编辑入口：进入对应的 FSM 状态等待新值。"""
     _, action, account_id_raw = (callback.data or "").split(":", 2)
     account_id = int(account_id_raw)
     prompts = {
@@ -1914,6 +2124,7 @@ async def profile_edit_value(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """收资料编辑的新值并写回。写 Telegram 失败时不写本地，错误原因直接回给用户。"""
     data = await state.get_data()
     account_id = int(data["account_id"])
     action = data["action"]
@@ -1984,6 +2195,7 @@ async def profile_edit_value(
 
 @router.callback_query(F.data.startswith("privacy_key:"))
 async def privacy_key_callback(callback: CallbackQuery) -> None:
+    """选了某个隐私项：列出该项可选的值。"""
     _, key_name, account_id_raw = (callback.data or "").split(":", 2)
     await answer_panel(callback, f"选择 {key_name} 的可见范围", privacy_rules_panel(int(account_id_raw), key_name))
 
@@ -1994,6 +2206,7 @@ async def privacy_set_callback(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """选了某个隐私值：执行修改并回到隐私面板。"""
     _, key_name, rule_name, account_id_raw = (callback.data or "").split(":", 3)
     account_id = int(account_id_raw)
     await callback.answer("处理中...")
@@ -2015,6 +2228,7 @@ async def login_email_configure(
     callback: CallbackQuery, state: FSMContext,
     sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool,
 ) -> None:
+    """登录邮箱保护的配置入口：选择保护后端（Cloudflare / Gmail / 关闭）。"""
     account_id = int((callback.data or "").rsplit(":", 1)[1])
     if await state.get_state() == LoginEmailEditFlow.code.state:
         await callback.answer("请先提交当前邮箱验证码，或取消当前操作。", show_alert=True)
@@ -2046,6 +2260,7 @@ async def login_email_edit_address(
     message: Message, state: FSMContext,
     sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool,
 ) -> None:
+    """改保护用的目标邮箱地址。地址会加密后入库。"""
     email = (message.text or "").strip()
     if len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
         await ask_with_cancel(message, "邮箱地址格式无效，请重新输入。", "name@example.com")
@@ -2085,6 +2300,11 @@ async def login_email_edit_code(
     message: Message, state: FSMContext,
     sessionmaker: async_sessionmaker[AsyncSession], client_pool: ClientPool,
 ) -> None:
+    """手动提交登录邮箱验证码。
+    
+        用户抢先自己填了验证码时走这条路径，会取消对应事件的窗口等待，
+        避免保护模块随后再填一次。
+        """
     data = await state.get_data()
     account_id = int(data["account_id"])
     deadline = datetime.fromisoformat(data["deadline"])
@@ -2125,6 +2345,7 @@ async def login_email_edit_code(
 
 @router.callback_query(F.data.startswith("twofa_edit:"))
 async def twofa_edit_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    """2FA 编辑入口：设置/修改/关闭分别进入不同状态。"""
     _, action, account_id_raw = (callback.data or "").split(":", 2)
     account_id = int(account_id_raw)
     prompts = {
@@ -2152,6 +2373,7 @@ async def twofa_edit_value(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """收 2FA 相关输入（新密码、旧密码）并执行。密码读完立即删除消息。"""
     data = await state.get_data()
     account_id = int(data["account_id"])
     action = data["action"]
@@ -2243,6 +2465,7 @@ async def twofa_email_code_value(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> None:
+    """收 2FA 恢复邮箱的验证码并提交。"""
     data = await state.get_data()
     account_id = int(data["account_id"])
     code = (message.text or "").strip()
@@ -2271,6 +2494,7 @@ async def settings_callback(
     callback: CallbackQuery,
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
+    """设置面板的通用回调分发。"""
     action = (callback.data or "").split(":", 1)[1]
     async with sessionmaker() as session:
         if action == "targets":
@@ -2291,6 +2515,7 @@ async def settings_callback(
 
 @router.callback_query(F.data.startswith("monitor:"))
 async def monitor_callback(callback: CallbackQuery, client_pool: ClientPool) -> None:
+    """监控面板回调：开关监控、调整间隔、触发一次检查。"""
     action = (callback.data or "").split(":", 1)[1]
     await callback.answer("处理中...")
     if not callback.message:
@@ -2450,6 +2675,7 @@ async def login_email_guard_callback(
     client_pool: ClientPool,
     state: FSMContext,
 ) -> None:
+    """登录邮箱保护面板回调：开关保护、选择后端、触发自检、查看最近事件。"""
     parts = (callback.data or "").split(":")
     action = parts[1] if len(parts) > 1 else "open"
     if action == "checkall":
@@ -2665,6 +2891,7 @@ async def login_email_domain_add(
     state: FSMContext,
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
+    """添加允许收信的别名域名。域名会做格式校验并去重。"""
     domain = (message.text or "").strip()
     await delete_sensitive_input(message)
     try:
@@ -2688,6 +2915,7 @@ async def login_email_window_update(
     state: FSMContext,
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
+    """调整等待窗口长度（小时）。非法值拒绝并保留原值。"""
     try:
         hours = parse_login_email_window_hours((message.text or "").strip())
     except ValueError as exc:
@@ -2731,6 +2959,7 @@ async def login_email_window_update(
 
 @router.callback_query(F.data.startswith("template:"))
 async def template_callback(callback: CallbackQuery) -> None:
+    """通知模板的选择与预览。模板只影响文案，不影响发送目标。"""
     key = (callback.data or "").split(":", 1)[1]
     template = TEMPLATES.get(key)
     if not template:
@@ -2745,6 +2974,7 @@ async def template_callback(callback: CallbackQuery) -> None:
 
 @router.message(Command("notify_test"))
 async def notify_test(message: Message) -> None:
+    """发一条测试通知，验证通知渠道配置是否正确。"""
     await message.answer("通知测试 OK。")
 
 
@@ -2754,6 +2984,11 @@ async def backup(
     sessionmaker: async_sessionmaker[AsyncSession],
     admin: Admin | None,
 ) -> None:
+    """触发一次数据库备份并回显结果。
+    
+        pg_dump 失败时把 stderr 截断后回给用户 —— 备份失败的具体原因
+        （权限、版本不匹配、磁盘满）只能从 stderr 看出来。
+        """
     await message.answer("正在创建加密字段数据库备份，请稍候……")
     try:
         path = await create_database_backup_async("bot")
@@ -2779,4 +3014,5 @@ async def backup(
 
 @router.message(F.text)
 async def unknown(message: Message) -> None:
+    """兜底处理器：未匹配任何命令时提示查看 /cmd。注册在最后，不拦截其他 handler。"""
     await message.answer("未知指令，发送 /cmd 查看用法。")
