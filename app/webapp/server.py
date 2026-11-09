@@ -1,3 +1,27 @@
+"""Mini App 的 HTTP 接口层。
+
+这个文件同时承担三件事，改动时三者都要看：
+
+1. **aiohttp 应用装配**（create_webapp / start_webapp）。路由表在这里，
+   静态资源在 app/webapp/static/。启动只绑 settings.mini_app_host，
+   默认 127.0.0.1 —— 反代在前面时不需要对外监听。
+2. **JSON API**（api_*）。所有入口先过 require_admin（除 index 与 webhook），
+   再按需读 sessionmaker 与 client_pool。响应格式统一走 account_payload /
+   各种 *_payload 函数，不在这里手拼字段名。
+3. **登录会话中转**（login_* 系列 + pending_login_email 字典）。
+   Telegram 登录是多步的，client 必须在多步之间存活，因此暂存在
+   app["pending_login"] / app["pending_login_email"] 里，键由 login_payload_key
+   生成（账号或匿名流程各一套）。这些字典**不落盘**，进程重启就丢，
+   所以登录中途重启需要用户重新开始 —— 这是刻意的，不引入跨重启的会话暂存。
+
+安全边界：
+- 唯一的身份来源是 Telegram init_data 的签名，见 webapp/auth.py。
+- temp_mail_webhook 是唯一不验 init_data 的入口，它用共享密钥 + 常量时间比较，
+  未配置密钥时直接 503（不允许「没配密钥就开放」）。
+- security_headers_middleware 对 /mini-app/api/ 与 /mini-app/static/ 加 no-store，
+  因为接口返回的是账号敏感数据，不能被中间缓存留存。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -81,6 +105,12 @@ logger = logging.getLogger(__name__)
 
 @web.middleware
 async def error_middleware(request: web.Request, handler):
+    """把异常统一转成 JSON 友好的错误响应。
+    
+        web.HTTPException 原样抛出（它们自带状态码和文案）；KeyError / ValueError
+        视为调用方参数错误转 400；其余一律 500 并记完整栈 —— 对外只回一句
+        通用文案，不泄漏内部异常信息。
+        """
     try:
         return await handler(request)
     except web.HTTPException:
@@ -95,6 +125,11 @@ async def error_middleware(request: web.Request, handler):
 
 @web.middleware
 async def security_headers_middleware(request: web.Request, handler):
+    """给所有响应加安全头。
+    
+        CSP 的 frame-ancestors 允许 web.telegram.org 与 *.telegram.org，
+        因为 Mini App 必须能在 Telegram 客户端内嵌打开；其他来源一律禁止。
+        """
     response = await handler(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -111,6 +146,16 @@ async def security_headers_middleware(request: web.Request, handler):
 
 
 async def temp_mail_webhook(request: web.Request) -> web.Response:
+    """接收 Cloudflare TempMail 的推送。
+    
+        唯一不验 init_data 的入口，鉴权靠 X-Temp-Mail-Secret 头与配置的
+        共享密钥做常量时间比较。未配置密钥时返回 503 而不是放行。
+    
+        只把收件域名在 Cloudflare 后端白名单内的邮件落库，其余静默丢弃 ——
+        对陌生人回 4xx 等于把「哪些域名在用」暴露给探测者。
+    
+        返回 stored 是实际插入行数，重复投递会小于收件人数。
+        """
     configured_secret = settings.temp_mail_webhook_secret
     provided_secret = request.headers.get("X-Temp-Mail-Secret", "")
     if not configured_secret:
@@ -139,6 +184,11 @@ async def temp_mail_webhook(request: web.Request) -> web.Response:
 
 
 def account_payload(account: TgAccount) -> dict[str, Any]:
+    """账号的对外 JSON 形态。
+    
+        只含脱敏字段：phone_masked 而非 phone，不含 session 与 2FA 密码。
+        新增字段时先想清楚它是否能给管理员看，不能就加 *_masked 版本。
+        """
     return {
         "id": account.id,
         "phone_masked": account.phone_masked,
@@ -155,14 +205,25 @@ def account_payload(account: TgAccount) -> dict[str, Any]:
 
 
 def login_payload_key(user_id: int, login_id: str) -> str:
+    """登录暂存字典的键。
+    
+        分两种流程：已绑定账号用 "account:<id>"，未绑定用 "anon:<tg_user_id>"。
+        匿名流程的键带用户 ID，避免多个管理员的登录流程互相覆盖。
+        """
     return f"{user_id}:{login_id}"
 
 
 def account_flow_key(user_id: int, account_id: int) -> str:
+    """账号级流程键，与 login_payload_key 的账号分支保持一致。"""
     return f"{user_id}:{account_id}"
 
 
 async def close_pending_login(pending: dict[str, Any] | None) -> None:
+    """关闭并丢弃一条登录暂存。
+    
+        client 会在这里被断开 —— 登录流程的每一步都可能中途放弃，
+        不在这里收口就会漏连接。
+        """
     if not pending:
         return
     client = pending.get("client")
@@ -174,6 +235,7 @@ async def close_pending_login(pending: dict[str, Any] | None) -> None:
 
 
 async def close_user_pending_logins(app: web.Application, user_id: int) -> None:
+    """丢弃某用户全部的登录暂存。用于用户主动取消或重开流程时清理残留。"""
     prefix = f"{user_id}:"
     keys = [key for key in app["pending_logins"] if key.startswith(prefix)]
     for key in keys:
@@ -181,6 +243,7 @@ async def close_user_pending_logins(app: web.Application, user_id: int) -> None:
 
 
 def qr_login_payload(qr_login: Any) -> dict[str, Any]:
+    """扫码登录暂存的对外快照：二维码链接、状态、剩余时间。不返回 client。"""
     image = base64.b64encode(login_qr_png(qr_login.url)).decode("ascii")
     return {
         "qr_image": f"data:image/png;base64,{image}",
@@ -193,6 +256,11 @@ def reusable_phone_login(
     user_id: int,
     phone: str,
 ) -> tuple[str, dict[str, Any]] | None:
+    """判断已有一条手机号登录暂存能否复用。
+    
+        同一手机号、同一流程、未过期才能复用 —— 复用能避免重复触发 Telegram
+        发短信（有频率限制），但复用错了会让用户看到别人的验证码流程。
+        """
     prefix = f"{user_id}:"
     for key, pending in app["pending_logins"].items():
         if not key.startswith(prefix) or pending.get("method") != "phone":
@@ -207,6 +275,7 @@ def reusable_phone_login(
 
 
 async def prune_pending_logins(app: web.Application, max_age_seconds: int = 600) -> None:
+    """清掉过期的登录暂存，返回清理数量。每次新增暂存前调用。"""
     now = time.time()
     stale_keys = [
         key
@@ -219,12 +288,14 @@ async def prune_pending_logins(app: web.Application, max_age_seconds: int = 600)
 
 
 async def cleanup_pending_logins(app: web.Application) -> None:
+    """后台清理循环。间隔固定，单次失败只记日志。"""
     for pending in list(app["pending_logins"].values()):
         await close_pending_login(pending)
     app["pending_logins"].clear()
 
 
 async def login_twofa_hint(client: Any) -> str:
+    """按账号是否启用 2FA 生成提示语，用于告诉用户下一步要不要输密码。"""
     try:
         twofa_info = await account_ops.get_2fa_info(client)
         return str(twofa_info.get("hint") or "-")
@@ -233,11 +304,17 @@ async def login_twofa_hint(client: Any) -> str:
 
 
 async def authenticated(request: web.Request) -> MiniAppUser:
+    """取当前请求的管理员身份；未通过时抛 HTTPUnauthorized。
+    
+        与 require_admin 的区别：这个不查数据库，只依赖中间件已放进 request 的结果，
+        用于需要身份但不需要重复验权的路径。
+        """
     sessionmaker = request.app["sessionmaker"]
     return await require_admin(request, sessionmaker)
 
 
 async def index(request: web.Request) -> web.FileResponse:
+    """Mini App 首页。不需要鉴权 —— 静态页本身不含数据，数据全靠后续 API。"""
     response = web.FileResponse(STATIC_DIR / "index.html")
     # Telegram's embedded browsers can keep an entry document alive for a long
     # time. Always revalidate it so fixes to the versioned assets take effect.
@@ -246,6 +323,11 @@ async def index(request: web.Request) -> web.FileResponse:
 
 
 async def api_bootstrap(request: web.Request) -> web.Response:
+    """一次性返回前端启动所需的全部数据。
+    
+        合并成一个请求是为了减少 Mini App 打开时的往返次数：设置、账号摘要、
+        监控状态、安全状态都在这里。字段只增不改，前端按需取用。
+        """
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]
@@ -313,6 +395,7 @@ async def api_bootstrap(request: web.Request) -> web.Response:
 
 
 def security_health_payload(report: SecurityHealthReport) -> dict[str, Any]:
+    """把安全自检报告转成 JSON。检查项顺序与报告一致，前端不重排。"""
     failed = sum(check.status == "fail" for check in report.checks)
     warnings = sum(check.status == "warn" for check in report.checks)
     return {
@@ -346,6 +429,7 @@ async def api_security_health(request: web.Request) -> web.Response:
 
 
 async def api_monitor_update(request: web.Request) -> web.Response:
+    """开关后台监控、调整间隔。改动即时生效，不需要重启。"""
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]
@@ -375,6 +459,7 @@ async def api_monitor_update(request: web.Request) -> web.Response:
 
 
 async def api_jobs(request: web.Request) -> web.Response:
+    """分页查询作业记录。只读。"""
     await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     try:
@@ -409,10 +494,12 @@ async def api_jobs(request: web.Request) -> web.Response:
 
 
 def account_pagination(total: int, requested_page: int) -> tuple[int, int, int]:
+    """把请求参数解析成分页窗口，越界时收敛到合法范围而不是报错。"""
     return account_page_window(total, requested_page)
 
 
 async def api_accounts(request: web.Request) -> web.Response:
+    """账号列表，分页。每项是 account_payload 的形态，不含凭证。"""
     await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     query = (request.query.get("q") or "").strip()
@@ -461,6 +548,11 @@ async def api_accounts(request: web.Request) -> web.Response:
 
 
 async def api_login_start(request: web.Request) -> web.Response:
+    """手机号登录第一步：请求验证码。
+    
+        已有一条可复用的暂存时直接复用它，避免重复触发 Telegram 发信。
+        返回是否需要 2FA、验证码投递方式等下一步所需信息。
+        """
     user = await authenticated(request)
     await prune_pending_logins(request.app)
     sessionmaker = request.app["sessionmaker"]
@@ -546,6 +638,10 @@ async def api_login_start(request: web.Request) -> web.Response:
 
 
 async def api_login_qr_start(request: web.Request) -> web.Response:
+    """创建扫码登录会话并返回二维码图片。
+    
+        二维码以 data URL 内联返回，前端不需要额外请求静态资源。
+        """
     user = await authenticated(request)
     await prune_pending_logins(request.app)
     await close_user_pending_logins(request.app, user.id)
@@ -575,6 +671,11 @@ async def api_login_qr_start(request: web.Request) -> web.Response:
 
 
 async def api_login_qr_poll(request: web.Request) -> web.Response:
+    """轮询扫码登录状态。
+    
+        扫码成功后在这里完成落库并把 client 交给 ClientPool，
+        因此前端轮询到 ok 就可以直接刷新账号列表。
+        """
     user = await authenticated(request)
     await prune_pending_logins(request.app)
     sessionmaker = request.app["sessionmaker"]
@@ -666,6 +767,7 @@ async def api_login_qr_poll(request: web.Request) -> web.Response:
 
 
 async def api_login_qr_cancel(request: web.Request) -> web.Response:
+    """取消扫码登录并断开 client。重复取消是安全的。"""
     user = await authenticated(request)
     data = await request.json()
     login_id = str(data.get("login_id") or "").strip()
@@ -677,6 +779,11 @@ async def api_login_qr_cancel(request: web.Request) -> web.Response:
 
 
 async def api_login_verify(request: web.Request) -> web.Response:
+    """提交验证码或 2FA 密码，推进登录流程。
+    
+        需要邮箱验证码时抛 EmailCodeRequired，由 error_middleware 之外的分支
+        转成 400 + code_length，前端据此提示用户去查邮箱。
+        """
     user = await authenticated(request)
     await prune_pending_logins(request.app)
     sessionmaker = request.app["sessionmaker"]
@@ -768,6 +875,11 @@ async def api_login_verify(request: web.Request) -> web.Response:
 
 
 async def api_import_session(request: web.Request) -> web.Response:
+    """导入一条已有 StringSession。
+    
+        session 无效时按异常类型区分「串格式错」与「已在别处登录」，
+        这两种情况用户要做的事完全不同。
+        """
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     data = await request.json()
@@ -790,6 +902,11 @@ async def api_import_session(request: web.Request) -> web.Response:
 
 
 async def api_export_sessions(request: web.Request) -> web.Response:
+    """导出指定账号的 session 明文。
+    
+        响应带 no-store，且这是唯一会把明文凭证发给前端的接口。
+        调用方必须是已验签的管理员。
+        """
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     data = await request.json()
@@ -840,6 +957,7 @@ async def api_export_sessions(request: web.Request) -> web.Response:
 
 
 async def api_account_detail(request: web.Request) -> web.Response:
+    """单账号完整详情，含安全快照与登录邮箱状态。不含凭证。"""
     await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     account_id = int(request.match_info["account_id"])
@@ -880,6 +998,11 @@ async def api_account_detail(request: web.Request) -> web.Response:
 
 
 async def api_account_delete(request: web.Request) -> web.Response:
+    """删除账号。
+    
+        删除期间在 ClientPool 打互斥标记并在 finally 解除；
+        解除失败会让该账号永远无法重连，因此这里用 try/finally 而不是条件分支。
+        """
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]
@@ -916,6 +1039,10 @@ async def api_account_delete(request: web.Request) -> web.Response:
 
 
 async def api_account_action(request: web.Request) -> web.Response:
+    """账号动作分发：重连、同步资料、退出登录等。
+    
+        动作名非法时返回 400 而不是静默忽略 —— 前端传错动作应该立刻暴露。
+        """
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]
@@ -988,6 +1115,7 @@ async def api_account_action(request: web.Request) -> web.Response:
 
 
 async def api_account_profile_update(request: web.Request) -> web.Response:
+    """改姓名/简介/用户名。Telegram 侧失败时不写本地，错误原因回给前端。"""
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]
@@ -1018,6 +1146,11 @@ async def api_account_profile_update(request: web.Request) -> web.Response:
 
 
 async def api_account_avatar_update(request: web.Request) -> web.Response:
+    """改头像。支持上传文件与白名单 URL 两种来源。
+    
+        上传路径受 MAX_REQUEST_SIZE 限制（与 MAX_AVATAR_BYTES 同值），
+        URL 路径必须命中 RANDOM_AVATAR_URLS 白名单。
+        """
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]
@@ -1085,6 +1218,7 @@ async def api_account_avatar_update(request: web.Request) -> web.Response:
 
 
 async def api_account_privacy_update(request: web.Request) -> web.Response:
+    """改单项隐私设置。key 必须是 Telegram 支持的隐私项。"""
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]
@@ -1106,6 +1240,11 @@ async def api_account_privacy_update(request: web.Request) -> web.Response:
 
 
 async def api_account_twofa(request: web.Request) -> web.Response:
+    """2FA 的设置/修改/关闭。
+    
+        密码只在请求体里出现一次，不落日志、不回显。
+        修改与关闭需要旧密码，设置不需要。
+        """
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]
@@ -1211,6 +1350,10 @@ async def api_account_twofa(request: web.Request) -> web.Response:
 
 
 async def api_account_login_email(request: web.Request) -> web.Response:
+    """登录邮箱保护的单账号配置读写。
+    
+        写入的地址与提示语加密后入库；响应只回掩码后的地址。
+        """
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]
@@ -1326,6 +1469,7 @@ async def api_account_login_email(request: web.Request) -> web.Response:
 
 
 async def api_account_login_email_window(request: web.Request) -> web.Response:
+    """调整单账号的等待窗口小时数。非法值拒绝并保留原值。"""
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     account_id = int(request.match_info["account_id"])
@@ -1360,6 +1504,7 @@ async def api_account_login_email_window(request: web.Request) -> web.Response:
 
 
 async def api_account_service_messages(request: web.Request) -> web.Response:
+    """查询该账号落库的服务号消息（换绑提醒、封禁通知等）。只读。"""
     await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     account_id = int(request.match_info["account_id"])
@@ -1397,6 +1542,7 @@ async def api_account_service_messages(request: web.Request) -> web.Response:
 
 
 async def api_targets(request: web.Request) -> web.Response:
+    """读取目标白名单。"""
     await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     async with sessionmaker() as session:
@@ -1418,6 +1564,7 @@ async def api_targets(request: web.Request) -> web.Response:
 
 
 async def api_targets_update(request: web.Request) -> web.Response:
+    """覆盖写入目标白名单。空列表表示不限制，与「拒绝一切」不同。"""
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     data = await request.json()
@@ -1463,6 +1610,7 @@ async def api_targets_update(request: web.Request) -> web.Response:
 
 
 async def api_rates(request: web.Request) -> web.Response:
+    """读取速率设置。"""
     await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     async with sessionmaker() as session:
@@ -1484,6 +1632,7 @@ async def api_rates(request: web.Request) -> web.Response:
 
 
 async def api_rate_update(request: web.Request) -> web.Response:
+    """写入速率设置。非法值由 validate_rate_values 拒绝。"""
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     data = await request.json()
@@ -1513,6 +1662,10 @@ async def api_rate_update(request: web.Request) -> web.Response:
 
 
 async def active_ids_from_range(session: AsyncSession, start_id: int, count: int) -> list[int]:
+    """把 "1,3,5-7" 这类区间表达式展开成 ID 列表。
+    
+        只返回库里真实存在的 active 账号，区间里的空号被跳过而不是报错。
+        """
     if start_id <= 0 or not 1 <= count <= 200:
         raise web.HTTPBadRequest(text="start_id 必须为正整数，count 必须在 1 到 200 之间")
     rows = await session.scalars(
@@ -1526,6 +1679,7 @@ async def active_ids_from_range(session: AsyncSession, start_id: int, count: int
 
 
 async def batch_accounts(session: AsyncSession, data: dict[str, Any]) -> list[int]:
+    """按选择方式取账号集合：显式 ID 列表或区间表达式。"""
     mode = data.get("account_mode")
     if mode == "range":
         return await active_ids_from_range(session, int(data["start_id"]), int(data["count"]))
@@ -1538,6 +1692,11 @@ async def batch_accounts(session: AsyncSession, data: dict[str, Any]) -> list[in
 
 
 async def api_batch_run(request: web.Request) -> web.Response:
+    """执行一次批量动作。
+    
+        动作名、目标、账号集合都来自请求体，逐项校验后再执行。
+        返回逐账号的结果，单个失败不影响其他账号。
+        """
     user = await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]
@@ -1617,6 +1776,11 @@ async def run_batch_call(
     target_ref: str,
     data: dict[str, Any],
 ) -> dict[str, Any]:
+    """批量动作的实际执行单元，带速率闸门。
+    
+        被 api_batch_run 与 Bot 侧的批量命令共用，因此这里不渲染文案，
+        只返回结构化结果。
+        """
     if job_type == "send":
         return await batch_ops.send_message(
             client_pool, account_id, target_ref, str(data.get("text") or "")
@@ -1652,6 +1816,11 @@ async def create_webapp(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> web.Application:
+    """装配 aiohttp 应用：中间件、路由、静态资源。
+    
+        不启动服务，返回 app 对象供测试与 start_webapp 使用。
+        静态资源挂在 /mini-app/static/，接口挂在 /mini-app/api/。
+        """
     app = web.Application(
         middlewares=[error_middleware, security_headers_middleware],
         client_max_size=MAX_REQUEST_SIZE,
@@ -1713,6 +1882,11 @@ async def start_webapp(
     sessionmaker: async_sessionmaker[AsyncSession],
     client_pool: ClientPool,
 ) -> web.AppRunner | None:
+    """按配置启动 HTTP 服务。
+    
+        只绑 settings.mini_app_host（默认 127.0.0.1）—— 对外暴露由反代负责，
+        这里不监听 0.0.0.0，避免绕过反代直接暴露接口。
+        """
     if not settings.mini_app_enabled:
         return None
     app = await create_webapp(sessionmaker, client_pool)
