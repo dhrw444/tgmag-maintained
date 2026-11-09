@@ -6,7 +6,7 @@ import re
 import shlex
 import tempfile
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from aiogram import Bot, F, Router
@@ -392,7 +392,7 @@ async def status_text(
         f"自动保护账号: {len(protected_connected_ids)}/{len(active_account_ids)}\n"
         f"保护域名: @{selected_domain or '-'}\n"
         f"保护白名单: {len(whitelist_ids)}\n"
-        f"时间: {datetime.now(timezone.utc).isoformat()}"
+        f"时间: {datetime.now(UTC).isoformat()}"
     )
 
 
@@ -2067,7 +2067,7 @@ async def login_email_edit_address(
             if active is not None:
                 raise ValueError("该账号正在自动换绑，请稍后再试。")
             sent = await account_ops.send_login_email_code(client, email)
-            deadline = datetime.now(timezone.utc) + timedelta(
+            deadline = datetime.now(UTC) + timedelta(
                 seconds=settings.login_email_poll_timeout_seconds
             )
             protector.manual_email_waits[account_id] = deadline
@@ -2088,7 +2088,7 @@ async def login_email_edit_code(
     data = await state.get_data()
     account_id = int(data["account_id"])
     deadline = datetime.fromisoformat(data["deadline"])
-    if deadline <= datetime.now(timezone.utc):
+    if deadline <= datetime.now(UTC):
         await state.clear()
         await message.answer("本次验证码等待已过期，请重新配置登录邮箱。", reply_markup=account_actions_panel(account_id))
         return
