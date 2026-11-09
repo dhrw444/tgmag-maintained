@@ -1,3 +1,13 @@
+"""安全防护自检。
+
+给「登录邮箱自动保护」这条链路做一次只读体检，把结果渲染成一段给人看的中文报告。
+所有检查都不触发真实的 Telegram 登录、不改登录邮箱 —— 它只回答「现在的配置和
+运行状态是否具备保护能力」，真实保护是否生效由保护成功/失败通知证明。
+
+检查项按依赖顺序排列，任何一项失败都会在报告里给出修复方向。数据库连不上时
+直接返回单条失败报告，因为后面的检查全部依赖它。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,6 +29,8 @@ from app.services.login_email_protection import (
 
 @dataclass(frozen=True)
 class SecurityHealthCheck:
+    """单项检查结果。status 只有 pass / fail / warn 三种，fix 仅在非 pass 时有值。"""
+
     name: str
     status: str
     detail: str
@@ -27,6 +39,8 @@ class SecurityHealthCheck:
 
 @dataclass(frozen=True)
 class SecurityHealthReport:
+    """一次体检的全部结果。available 只要求没有 fail，warn 不影响整体可用性。"""
+
     checks: tuple[SecurityHealthCheck, ...]
     checked_at: datetime
 
@@ -35,6 +49,12 @@ class SecurityHealthReport:
         return all(check.status == "pass" for check in self.checks)
 
     def render(self) -> str:
+        """渲染成 Telegram 可直接发送的纯文本。
+
+        结论分三档：有 fail 就是不可用，只有 warn 是「基础通过但未证实」，
+        全 pass 才是可用。这个区分是刻意的 —— 凭据不全导致跳过实测时，
+        不能报成可用。
+        """
         failed = sum(check.status == "fail" for check in self.checks)
         warnings = sum(check.status == "warn" for check in self.checks)
         if failed:

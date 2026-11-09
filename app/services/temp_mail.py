@@ -1,3 +1,17 @@
+"""临时邮箱收件箱。
+
+Cloudflare TempMail 通过 webhook 把邮件推到这里，登录流程再从库里读验证码。
+设计约束：
+
+- 收件域名白名单来自 settings.login_email_alias_domains。不在白名单的收件人
+  会被静默丢弃（parse_allowed_recipients 不抛错），因为 webhook 是公开端点，
+  对陌生人回 4xx 等于把「哪些域名在用」暴露给探测者。
+- 唯一键是 (id, to)，不是 id。同一封邮件可能同时投给多个本地收件人，
+  每个收件人各存一行，重复投递用 ON CONFLICT DO NOTHING 吃掉。
+- 这里写的是原始 payload 的文本化结果，不做 MIME 解析 —— 解析在上游完成，
+  这一层只负责落库和按收件人查询。
+"""
+
 from __future__ import annotations
 
 import json
@@ -19,6 +33,11 @@ def normalize_recipient(
     address: str,
     allowed_domains: frozenset[str] | set[str] | tuple[str, ...] | None = None,
 ) -> tuple[str, str]:
+    """校验并规范化收件地址，返回 (完整地址, 域名)。
+
+    拒绝超过 320 字符、不含恰好一个 @、本地部分为空或超过 64 字符、
+    以及域名不在白名单的地址，统一抛 ValueError。
+    """
     normalized = address.strip().lower()
     if len(normalized) > 320 or normalized.count("@") != 1:
         raise ValueError("invalid recipient address")
@@ -33,6 +52,13 @@ def parse_allowed_recipients(
     value: object,
     allowed_domains: frozenset[str] | set[str] | tuple[str, ...] | None = None,
 ) -> tuple[tuple[str, str], ...]:
+    """从 payload 的 to 字段解析出所有合法收件人。
+
+    容忍字符串或字符串列表两种形态。getaddresses 会解析出显示名，
+    只取地址部分；非法的、域名不在白名单的条目直接跳过而不是整批失败 ——
+    一封邮件投给多个地址时，只要有一个合法就应该入库。
+    返回去重后的 (地址, 域名) 元组，顺序保持首次出现。
+    """
     if isinstance(value, str):
         headers = [value]
     elif isinstance(value, list) and all(isinstance(item, str) for item in value):
@@ -66,6 +92,13 @@ async def store_temp_mail_payload(
     *,
     allowed_domains: frozenset[str] | set[str] | tuple[str, ...] | None = None,
 ) -> int:
+    """把一个 webhook payload 落库，返回实际插入的行数。
+
+    没有任何合法收件人时返回 0（不抛错）。重复投递靠 (id, to) 上的
+    ON CONFLICT DO NOTHING 忽略，返回值因此可能小于收件人数量。
+    payload 的 id 缺失或超过 255 字符抛 ValueError —— 这个字段是唯一键的一部分，
+    不能容忍脏值。
+    """
     message_id = str(payload.get("id") or "").strip()
     if not message_id or len(message_id) > 255:
         raise ValueError("id must be a non-empty string no longer than 255 characters")
@@ -103,6 +136,11 @@ async def list_messages_for_recipient(
     *,
     limit: int = 100,
 ) -> list[TempMailMessage]:
+    """按收件人取最近的邮件，按 received_at 倒序。
+
+    recipient 会先过 normalize_recipient，因此传入非白名单域名会抛 ValueError。
+    limit 必须在 1..500 之间。
+    """
     normalized, _ = normalize_recipient(recipient)
     if not 1 <= limit <= 500:
         raise ValueError("limit must be between 1 and 500")

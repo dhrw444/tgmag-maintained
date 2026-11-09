@@ -1,3 +1,17 @@
+"""账号删除。
+
+删除一个账号牵涉十几张表，这里的顺序不是随手排的：先删引用 account_id 的子表，
+最后删 tg_accounts 本体。所有语句在同一条事务里跑，开头拿 pg_advisory_xact_lock
+（和账号容量检查共用一把锁），避免删除和新增并发时容量算错。
+
+比「删行」更容易做错的是**残留引用**：作业参数和审计 payload 里会夹带 account_id，
+不清理就等于删了账号但留下了它的标识。这里按 JSON 结构递归剥掉匹配的 account_id，
+而不是整段清空 —— 保住同一条记录里其他账号的信息。
+
+删除动作本身只留一条不含任何账号信息的审计记录。这是刻意的：审计日志如果
+记下了 phone 或 username，删除就失去意义了。
+"""
+
 from __future__ import annotations
 
 import logging
@@ -33,13 +47,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class AccountDeletionResult:
+    """删除结果。deleted_rows 是各表 rowcount 之和，用于向操作者回显。"""
+
     account_id: int
     phone_masked: str
     deleted_rows: int
 
 
 def account_owned_delete_statements(account_id: int) -> tuple[Any, ...]:
-    """Build narrowly scoped statements in foreign-key-safe deletion order."""
+    """返回按外键依赖排序的删除语句，从叶子表到 tg_accounts 本体。
+
+    每条语句都带 account_id 条件，没有全表删除。调用方必须按返回顺序执行，
+    否则可能先删父表而留下悬空外键。
+    """
     return (
         delete(LoginEmailProtectionEvent).where(
             LoginEmailProtectionEvent.account_id == account_id
@@ -60,6 +80,12 @@ def account_owned_delete_statements(account_id: int) -> tuple[Any, ...]:
 
 
 def _without_account_reference(value: Any, account_id: int, key: str | None = None) -> Any:
+    """递归剥掉 JSON 里指向该账号的引用，返回新对象（不修改入参）。
+
+    两种形态都处理：字典里 key 为 account_id 且值等于目标时整条丢弃；
+    列表里 key 为 accounts / account_ids 时把匹配项从列表中移除。
+    其他位置出现同一个数字不动 —— 它可能是别的账号的 id。
+    """
     if isinstance(value, dict):
         cleaned: dict[str, Any] = {}
         for child_key, child_value in value.items():
@@ -80,7 +106,12 @@ async def delete_account_records(
     account_id: int,
     admin: Admin | None,
 ) -> AccountDeletionResult:
-    """Remove one account and every active database record that identifies it."""
+    """删除一个账号及其全部可识别它的数据库记录。
+
+    调用方负责事务边界；本函数内部只 flush 不 commit。
+    账号不存在时抛 ValueError。已解密的临时邮箱目标会连带删除对应的收件邮件，
+    解密失败的条目只记警告并继续 —— 一行读不出来的密文不该让整个删除卡住。
+    """
     await session.execute(text(f"SELECT pg_advisory_xact_lock({ACCOUNT_CAPACITY_LOCK_ID})"))
     account = await session.get(TgAccount, account_id, with_for_update=True)
     if account is None:
