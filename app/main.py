@@ -30,7 +30,10 @@ logger = logging.getLogger(__name__)
 
 
 async def restore_admin_keyboards(bot: Bot) -> None:
-    """Re-send the canonical reply keyboard after every successful service start."""
+    """服务每次成功启动后，给每个管理员重发一次标准回复键盘。
+
+只发消息、不写库；某个管理员发失败只记日志，不影响其他人和启动流程。
+"""
     for admin_id in settings.admin_ids:
         try:
             await bot.send_message(

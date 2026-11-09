@@ -188,7 +188,11 @@ def parse_login_email_window_hours(raw_hours: object) -> int:
 
 
 def is_login_code_alert(text: str) -> bool:
-    """Recognize the 777000 login-code alert without depending on its full wording."""
+    """判断这封是不是 777000 发来的登录验证码提醒。
+
+只认发件人和关键标志，不匹配整段文案 —— Telegram 会改措辞，
+绑死全文会导致漏判。
+"""
     value = text or ""
     return bool(
         LOGIN_CODE_VALUE_PATTERN.search(value)
@@ -200,7 +204,11 @@ PREMIUM_NOTICE_PATTERN = re.compile(r"(?<!\w)premium(?!\w)", re.IGNORECASE)
 
 
 def is_premium_notice(text: str) -> bool:
-    """Recognize the shared Premium marker in trusted 777000 service notices."""
+    """识别可信 777000 通知里和验证码邮件共用的 Premium 标记。
+
+这类邮件版式相同但不是登录提醒，必须排除，否则会被当成登录
+触发换绑流程。
+"""
     value = unicodedata.normalize("NFKC", text or "")
     value = "".join(char for char in value if unicodedata.category(char) != "Cf")
     return bool(PREMIUM_NOTICE_PATTERN.search(value))
@@ -218,7 +226,10 @@ def is_login_email_protection_alert(text: str) -> bool:
 async def recover_incomplete_events(
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> int:
-    """Interrupt pre-email requests while preserving resumable email waits."""
+    """拦住「发验证码之前」的请求，同时放过可续等的邮件等待。
+
+前者要立刻打断以免重复发码，后者已经在等邮件，打断会白等一轮。
+"""
     async with sessionmaker() as session:
         result = await session.execute(
             update(LoginEmailProtectionEvent)
@@ -266,7 +277,11 @@ def parse_telegram_login_email(
     target_email: str,
     expected_sender: str = "noreply@telegram.org",
 ) -> TelegramLoginEmailCode | None:
-    """Return a code only when sender, recipient and Login purpose all match."""
+    """只有发件人、收件人、用途三项全部对上才返回验证码。
+
+任意一项不符按「不是登录邮件」处理，返回 None 而不是抛错 ——
+收件箱里混着其他邮件是常态。
+"""
     message = BytesParser(policy=policy.default).parsebytes(raw_message)
     senders = {address.lower() for _, address in getaddresses([message.get("From", "")]) if address}
     if expected_sender.lower() not in senders:
@@ -546,7 +561,11 @@ class TempMailCodeReader:
 
 
 class RoutedCodeReader:
-    """Select the configured inbox reader from the target email domain."""
+    """按收件域名从路由表里挑一个 reader。
+
+域名没登记时回落到默认后端；默认由凭据是否齐全推导，
+不由配置开关决定。
+"""
 
     def __init__(self, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
         self.sessionmaker = sessionmaker

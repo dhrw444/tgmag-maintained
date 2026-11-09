@@ -200,7 +200,10 @@ BOT_COMMANDS = [
 
 
 async def configure_bot_ui(bot: Bot) -> None:
-    """Publish commands and a native Mini App launcher to Telegram clients."""
+    """把命令菜单和 Mini App 启动按钮发到 Telegram 客户端。
+
+幂等：重启后重复调用只会覆盖同一份配置，不会累积。
+"""
     await bot.set_my_commands(BOT_COMMANDS)
     await bot.set_chat_menu_button(menu_button=bot_menu_button())
 
@@ -655,7 +658,11 @@ async def answer_panel(callback: CallbackQuery, text: str, reply_markup=None) ->
 
 
 async def dismiss_panel(callback: CallbackQuery) -> None:
-    """Close an inline panel without adding a new message to the chat."""
+    """关掉当前内联面板，且不在会话里留下新消息。
+
+消息已经被删或权限不够时静默放过 —— 用户目的是「关掉」，
+删不掉不该弹错误。
+"""
     await callback.answer()
     if not callback.message:
         return

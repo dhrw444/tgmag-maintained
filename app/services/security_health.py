@@ -101,7 +101,11 @@ async def run_security_health_check(
     session: AsyncSession,
     client_pool: object,
 ) -> SecurityHealthReport:
-    """Run non-destructive checks across every operational protection dependency."""
+    """对保护链路的每个依赖做一轮只读体检，汇总成报告。
+
+全部检查都不触发真实登录、不改数据库、不重发验证码，只读状态与
+连通性，所以随时可以跑，也可被 Mini App 按需调用。
+"""
     checked_at = datetime.now(UTC)
     checks: list[SecurityHealthCheck] = []
 

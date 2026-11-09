@@ -419,7 +419,10 @@ def security_health_payload(report: SecurityHealthReport) -> dict[str, Any]:
 
 
 async def api_security_health(request: web.Request) -> web.Response:
-    """Run the real, non-destructive protection dependency checks on demand."""
+    """Mini App 按需触发的保护链路体检接口。
+
+需要登录态；只读检查，不产生副作用，所以没有额外的写权限门槛。
+"""
     await authenticated(request)
     sessionmaker = request.app["sessionmaker"]
     client_pool: ClientPool = request.app["client_pool"]

@@ -209,7 +209,11 @@ class ClientPool:
         self.clients.clear()
 
     async def check_login_email_health(self) -> bool:
-        """Validate all email backends used by configured domains."""
+        """把当前每个已配置域名用到的收信后端都验一遍连通性。
+
+结果（检查时间 / 错误）记在实例上供页面展示；失败不抛异常，
+返回 False 让调用方决定怎么提示。
+"""
         async with self._login_email_health_lock:
             self.login_email_health_checked_at = datetime.now(UTC)
             try:
@@ -246,7 +250,11 @@ class ClientPool:
                 logger.exception("Failed to disconnect dropped account %s", account_id)
 
     async def begin_account_deletion(self, account_id: int) -> None:
-        """Fence an account from reconnects, cancel its workers, then disconnect it."""
+        """删除账号前的封场：先挡住重连，再取消它的任务，最后断开连接。
+
+重复调用会抛 ValueError —— 删除流程不可重入，第二次说明状态不对。
+封场期间所有会碰该账号的入口都会先查 _deleting_account_ids。
+"""
         async with self._lock:
             if account_id in self._deleting_account_ids:
                 raise ValueError("账号正在删除，请勿重复操作")
@@ -464,7 +472,11 @@ class ClientPool:
         text: str,
         received_at: datetime,
     ) -> bool:
-        """Only protect login alerts created after the active session was admitted."""
+        """只保护「当前这条已上线会话」之后产生的新登录提醒。
+
+会话建立之前收到的旧提醒往往是上一位持有者留下的，拿它去换绑
+会把正在用的账号踢掉，所以按时间戳直接排除。
+"""
         if not is_login_email_protection_alert(text):
             return False
         async with self.sessionmaker() as session:
