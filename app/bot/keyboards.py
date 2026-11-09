@@ -16,7 +16,7 @@ from app.db.models import LoginEmailProtectionEvent, TgAccount
 
 
 def main_menu() -> ReplyKeyboardMarkup:
-    """Return the single client-retained, user-collapsible reply keyboard."""
+    """主菜单回复键盘。常驻但可折叠（is_persistent=False），不占满屏幕。"""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="系统状态"), KeyboardButton(text="账号管理")],
@@ -34,12 +34,14 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 
 def cancel_inline() -> InlineKeyboardMarkup:
+    """任何多步流程的取消按钮。callback_data 固定为 flow:cancel。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="取消当前操作", callback_data="flow:cancel")]]
     )
 
 
 def login_phone_panel() -> InlineKeyboardMarkup:
+    """手机号登录面板，提供转二维码登录和取消两个出口。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="改用二维码登录", callback_data="login:qr")],
@@ -49,6 +51,7 @@ def login_phone_panel() -> InlineKeyboardMarkup:
 
 
 def force_reply(placeholder: str) -> ForceReply:
+    """强制回复框。selective=True 只对当前用户生效，不打扰群里其他人。"""
     return ForceReply(
         force_reply=True,
         input_field_placeholder=placeholder,
@@ -57,6 +60,7 @@ def force_reply(placeholder: str) -> ForceReply:
 
 
 def mini_app_panel() -> InlineKeyboardMarkup | None:
+    """Mini App 入口面板；未配置 mini_app_public_url 时返回 None，调用方要判空。"""
     mini_app_url = settings.mini_app_public_url.strip()
     if not mini_app_url:
         return None
@@ -69,7 +73,7 @@ def mini_app_panel() -> InlineKeyboardMarkup | None:
 
 
 def bot_menu_button() -> MenuButtonCommands | MenuButtonWebApp:
-    """Use Telegram's native Web App launcher whenever the Mini App is configured."""
+    """Bot 菜单按钮：配置了 Mini App 就用原生 Web App 启动器，否则退回命令列表。"""
     mini_app_url = settings.mini_app_public_url.strip()
     if not settings.mini_app_enabled or not mini_app_url:
         return MenuButtonCommands()
@@ -80,6 +84,7 @@ def bot_menu_button() -> MenuButtonCommands | MenuButtonWebApp:
 
 
 def account_button_label(account: TgAccount) -> str:
+    """账号按钮的显示文本，优先 user_id，其次 @username，最后掩码手机号。"""
     if account.user_id:
         identity = str(account.user_id)
     elif account.username:
@@ -94,6 +99,7 @@ def accounts_panel(
     page: int = 1,
     pages: int = 1,
 ) -> InlineKeyboardMarkup:
+    """账号列表分页面板。pages > 1 时才出现翻页行。"""
     rows: list[list[InlineKeyboardButton]] = []
     for account in accounts:
         rows.append(
@@ -131,6 +137,7 @@ def accounts_panel(
 
 
 def account_actions_panel(account_id: int, accounts_page: int = 1) -> InlineKeyboardMarkup:
+    """单账号操作面板，所有账号级动作的入口。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -205,6 +212,7 @@ def account_delete_confirm_panel(
     *,
     final: bool = False,
 ) -> InlineKeyboardMarkup:
+    """删除确认面板。final=False 是第一次确认，final=True 才是永久删除。"""
     action = "confirm" if final else "verify"
     label = "确认永久删除" if final else "继续删除"
     return InlineKeyboardMarkup(
@@ -226,6 +234,7 @@ def account_delete_confirm_panel(
 
 
 def post_login_security_panel(account_id: int) -> InlineKeyboardMarkup:
+    """登录成功后的提示面板，引导去设置 2FA。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -243,6 +252,7 @@ def post_login_security_panel(account_id: int) -> InlineKeyboardMarkup:
 
 
 def profile_edit_panel(account_id: int) -> InlineKeyboardMarkup:
+    """资料编辑入口。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -263,6 +273,7 @@ def profile_edit_panel(account_id: int) -> InlineKeyboardMarkup:
 
 
 def avatar_panel(account_id: int) -> InlineKeyboardMarkup:
+    """头像设置入口：上传本地图片或从白名单随机取一张。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -283,6 +294,7 @@ def avatar_panel(account_id: int) -> InlineKeyboardMarkup:
 
 
 def privacy_keys_panel(account_id: int) -> InlineKeyboardMarkup:
+    """隐私项选择，每个按钮对应一个 Telegram 隐私 key。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -311,6 +323,7 @@ def privacy_keys_panel(account_id: int) -> InlineKeyboardMarkup:
 
 
 def privacy_rules_panel(account_id: int, key_name: str) -> InlineKeyboardMarkup:
+    """单个隐私项的可选值。key_name 会原样进 callback_data。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -332,6 +345,7 @@ def privacy_rules_panel(account_id: int, key_name: str) -> InlineKeyboardMarkup:
 
 
 def twofa_panel(account_id: int) -> InlineKeyboardMarkup:
+    """2FA 操作面板：查询、设置、修改、恢复邮箱、关闭。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -359,6 +373,7 @@ def twofa_panel(account_id: int) -> InlineKeyboardMarkup:
 
 
 def batch_panel() -> InlineKeyboardMarkup:
+    """批量操作与模板入口。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -380,6 +395,7 @@ def batch_panel() -> InlineKeyboardMarkup:
 
 
 def settings_panel() -> InlineKeyboardMarkup:
+    """设置入口：白名单与速率。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -396,6 +412,7 @@ def settings_panel() -> InlineKeyboardMarkup:
 
 
 def monitor_panel() -> InlineKeyboardMarkup:
+    """监听控制面板。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -413,6 +430,7 @@ def monitor_panel() -> InlineKeyboardMarkup:
 
 
 def login_email_guard_panel() -> InlineKeyboardMarkup:
+    """登录邮箱保护总面板。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -439,6 +457,10 @@ def login_email_domains_panel(
     selected_domain: str | None,
     domain_backends: dict[str, str] | None = None,
 ) -> InlineKeyboardMarkup:
+    """域名列表。每行一个后端切换按钮加一个删除按钮，索引进 callback_data。
+
+    用索引而不是域名本身：域名可能很长，而 callback_data 有 64 字节上限。
+    """
     domain_backends = domain_backends or {}
     rows: list[list[InlineKeyboardButton]] = []
     for index, domain in enumerate(domains):
@@ -474,6 +496,7 @@ def login_email_whitelist_panel(
     accounts: list[TgAccount],
     whitelisted_ids: set[int],
 ) -> InlineKeyboardMarkup:
+    """账号白名单开关。最多显示 30 个账号，避免按钮过多被 Telegram 拒收。"""
     rows: list[list[InlineKeyboardButton]] = []
     account_buttons: list[InlineKeyboardButton] = []
     for account in accounts[:30]:
@@ -490,6 +513,7 @@ def login_email_whitelist_panel(
 
 
 def login_email_delete_confirm_panel(index: int) -> InlineKeyboardMarkup:
+    """删除域名的二次确认。"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -506,6 +530,7 @@ def login_email_delete_confirm_panel(index: int) -> InlineKeyboardMarkup:
 def login_email_events_panel(
     events: list[LoginEmailProtectionEvent],
 ) -> InlineKeyboardMarkup:
+    """保护事件列表。status 未知时原样显示，便于发现新状态忘了加标签。"""
     labels = {
         "succeeded": "✅ 成功",
         "failed": "❌ 失败",
@@ -531,6 +556,7 @@ def login_email_events_panel(
 
 
 def login_email_account_panel(account_id: int, whitelisted: bool) -> InlineKeyboardMarkup:
+    """单账号保护设置：等待时间与白名单开关。"""
     label = "移出白名单" if whitelisted else "加入白名单"
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -556,6 +582,7 @@ def login_email_retry_panel(
     domains: tuple[str, ...],
     failed_domain: str | None,
 ) -> InlineKeyboardMarkup:
+    """失败重试面板，列出可用域名并标出上次失败的那个。"""
     rows = [
         [
             InlineKeyboardButton(
