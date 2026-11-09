@@ -53,6 +53,9 @@ DOMAIN_PATTERN = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 )
 LOGIN_CODE_VALUE_PATTERN = re.compile(r"(?<!\d)\d{5,8}(?!\d)")
+# 手动等邮件时等待循环的复检间隔。状态只会被用户提交验证码或外部取消推进，
+# 1 秒复检没有收益，只会让每个等待中的事件每秒开一次数据库会话。
+MANUAL_WAIT_RECHECK_SECONDS = 10
 LOGIN_CODE_ALERT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -719,10 +722,19 @@ class LoginEmailProtector:
         return (lock is not None and lock.locked()) or self.manual_email_wait_remaining(account_id) > 0
 
     def manual_email_wait_remaining(self, account_id: int) -> float:
+        """返回该账号手动等邮件的剩余秒数；已过期的条目顺手清掉。
+
+        调用方在窗口等待循环里每轮都会问一次，过期条目留在字典里没有任何意义，
+        而它只在用户成功提交验证码时才被 pop，不在这里清就会一直挂着。
+        """
         deadline = getattr(self, "manual_email_waits", {}).get(account_id)
         if deadline is None:
             return 0
-        return max(0, (deadline - datetime.now(UTC)).total_seconds())
+        remaining = (deadline - datetime.now(UTC)).total_seconds()
+        if remaining <= 0:
+            self.manual_email_waits.pop(account_id, None)
+            return 0
+        return remaining
 
     async def cancel_account_tasks(self, account_id: int, event_ids: set[int]) -> None:
         """Cancel protection waiters and forget per-account synchronization state."""
@@ -965,7 +977,11 @@ class LoginEmailProtector:
 
                 manual_wait = self.manual_email_wait_remaining(account_id)
                 if manual_wait > 0:
-                    await asyncio.sleep(min(manual_wait, 1))
+                    # 手动等邮件期间不需要每秒回库查询：状态只由用户提交验证码改变，
+                    # 而那条路径会通过 _window_waiters 之外的方式推进事件状态。
+                    # 睡到等待截止（上限一个较短的轮询间隔，防止用户在别处改了状态后
+                    # 这里长时间不察觉）。
+                    await asyncio.sleep(min(manual_wait, MANUAL_WAIT_RECHECK_SECONDS))
                     continue
                 change_lock = self._change_locks.setdefault(account_id, asyncio.Lock())
                 async with change_lock:

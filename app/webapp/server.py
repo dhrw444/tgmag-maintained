@@ -6,7 +6,6 @@ import logging
 import secrets
 import tempfile
 import time
-import urllib.request
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,6 +44,15 @@ from app.db.models import (
     TgSession,
 )
 from app.services.account_deletion import delete_account_records
+from app.services.account_shared import (
+    MAX_AVATAR_BYTES,
+    RANDOM_AVATAR_URLS,
+    EmailCodeRequired,
+    build_session_export,
+    download_url_to_file,
+    parse_account_selection,
+    require_email_code,
+)
 from app.services.audit import audit
 from app.services.crypto import decrypt_text, encrypt_text
 from app.services.jobs import add_job_item, create_job, finish_job
@@ -66,15 +74,9 @@ from app.tg.client_pool import ClientPool
 from app.webapp.auth import MiniAppUser, require_admin
 
 STATIC_DIR = Path(__file__).with_name("static")
-MAX_REQUEST_SIZE = 5 * 1024 * 1024
+# 请求体上限。随机头像下载和上传头像共用同一个字节数，见 account_shared.MAX_AVATAR_BYTES。
+MAX_REQUEST_SIZE = MAX_AVATAR_BYTES
 logger = logging.getLogger(__name__)
-RANDOM_AVATAR_URLS = [
-    "https://api.btstu.cn/sjbz/api.php?lx=dongman&format=images",
-    "https://api.btstu.cn/sjbz/api.php?lx=meizi&format=images",
-    "https://img.xjh.me/random_img.php?return=302&type=bg&ctype=acg",
-    "https://picsum.photos/1200/1200.jpg",
-    "https://picsum.photos/1024/1024.jpg",
-]
 
 
 @web.middleware
@@ -106,31 +108,6 @@ async def security_headers_middleware(request: web.Request, handler):
     if request.path.startswith(("/mini-app/api/", "/mini-app/static/")):
         response.headers["Cache-Control"] = "no-store"
     return response
-
-
-class EmailCodeRequired(Exception):
-    def __init__(self, code_length: int):
-        self.code_length = code_length
-        super().__init__(f"email confirmation code required: {code_length}")
-
-
-def require_email_code(code_length: int) -> str:
-    raise EmailCodeRequired(code_length)
-
-
-def download_url_to_file(url: str, path: Path) -> None:
-    if url not in RANDOM_AVATAR_URLS or not url.startswith("https://"):
-        raise ValueError("不允许的随机头像来源")
-    request = urllib.request.Request(url, headers={"User-Agent": "tg-account-bot/0.1"})
-    # URL is selected from the immutable HTTPS allowlist above, never user input.
-    with urllib.request.urlopen(request, timeout=20) as response:  # nosec B310
-        payload = response.read(MAX_REQUEST_SIZE + 1)
-    if len(payload) > MAX_REQUEST_SIZE:
-        raise ValueError("图片超过 5MB 限制")
-    header = payload[:16]
-    if not header.startswith((b"\xff\xd8\xff", b"\x89PNG", b"RIFF", b"GIF8")):
-        raise ValueError("接口返回的不是可识别图片")
-    path.write_bytes(payload)
 
 
 async def temp_mail_webhook(request: web.Request) -> web.Response:
@@ -183,90 +160,6 @@ def login_payload_key(user_id: int, login_id: str) -> str:
 
 def account_flow_key(user_id: int, account_id: int) -> str:
     return f"{user_id}:{account_id}"
-
-
-def parse_account_selection(value: str) -> list[int]:
-    tokens = [token.strip() for token in value.replace("，", ",").replace(" ", ",").split(",")]
-    account_ids: list[int] = []
-    seen: set[int] = set()
-    for token in tokens:
-        if not token:
-            continue
-        if "-" in token:
-            start_raw, end_raw = token.split("-", 1)
-            start_id, end_id = int(start_raw), int(end_raw)
-            if start_id > end_id:
-                start_id, end_id = end_id, start_id
-            values = range(start_id, end_id + 1)
-        else:
-            values = [int(token)]
-        for account_id in values:
-            if account_id <= 0:
-                raise ValueError("账号ID必须为正整数")
-            if account_id not in seen:
-                seen.add(account_id)
-                account_ids.append(account_id)
-                if len(account_ids) > 200:
-                    raise ValueError("一次最多选择 200 个账号")
-    if not account_ids:
-        raise ValueError("没有识别到账号ID")
-    return account_ids
-
-
-async def build_session_export(
-    session: AsyncSession, account_ids: list[int]
-) -> tuple[str, int, list[str]]:
-    lines = [
-        "# Telethon StringSession export",
-        f"# generated_at={datetime.now(UTC).isoformat()}",
-        "# 警告：string_session 等同于账号登录凭证，请不要发给不可信的人。",
-        "# 导入时使用 phone 和 string_session 两项。",
-        "",
-    ]
-    exported = 0
-    skipped: list[str] = []
-    for account_id in account_ids:
-        account = await session.get(TgAccount, account_id)
-        if account is None:
-            skipped.append(f"#{account_id}: 账号不存在")
-            continue
-        tg_session = await session.scalar(
-            select(TgSession)
-            .where(TgSession.account_id == account.id, TgSession.is_active.is_(True))
-            .order_by(TgSession.id.desc())
-            .limit(1)
-        )
-        if tg_session is None:
-            skipped.append(f"#{account.id}: 没有 active session")
-            continue
-        try:
-            phone = decrypt_text(account.phone_encrypted) or account.phone_masked
-            session_str = decrypt_text(tg_session.session_encrypted)
-        except Exception as exc:  # noqa: BLE001 - report per-account export failures
-            skipped.append(f"#{account.id}: 解密失败 {exc}")
-            continue
-        if not session_str:
-            skipped.append(f"#{account.id}: session 为空")
-            continue
-        exported += 1
-        lines.extend(
-            [
-                "[account]",
-                f"account_id={account.id}",
-                f"telegram_user_id={account.user_id or ''}",
-                f"username={('@' + account.username) if account.username else ''}",
-                f"phone={phone}",
-                f"phone_masked={account.phone_masked}",
-                "session_type=telethon_string",
-                f"string_session={session_str}",
-                "",
-            ]
-        )
-    if skipped:
-        lines.append("[skipped]")
-        lines.extend(skipped)
-        lines.append("")
-    return "\n".join(lines), exported, skipped
 
 
 async def close_pending_login(pending: dict[str, Any] | None) -> None:

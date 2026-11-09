@@ -1,3 +1,15 @@
+"""ORM 模型。
+
+所有能标识真实账号的字段都存加密后的值（`*_encrypted`），密钥来自
+FERNET_KEY。明文副本只保留展示用的掩码（`phone_masked`）和 Telegram
+公开资料（username / first_name / last_name），这几项本来就能被他人看到。
+
+两个部分唯一索引（文件末尾）是这个 schema 的关键约束，不是优化：
+同一 Telegram 用户不能重复入库，同一账号同时只能有一个活跃 session。
+它们用 `postgresql_where` 表达，因为 PostgreSQL 的普通 UNIQUE 会把
+NULL 视作互不相同，挡不住"多条 user_id 为 NULL"或"多条已失效 session"。
+"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -21,10 +33,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
-    pass
+    """SQLAlchemy 2.0 声明式基类。迁移脚本通过 target_metadata 引用它的 metadata。"""
 
 
 class Admin(Base):
+    """Bot 管理员。role 目前只有 owner，保留字段是为了将来分级授权不用改表。"""
+
     __tablename__ = "admins"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -35,6 +49,15 @@ class Admin(Base):
 
 
 class TgAccount(Base):
+    """一个受管理的 Telegram 账号。
+
+    `status` 是调度用的状态机字段（new / active / limited / ...），
+    值集合由 app/tg/account_ops.py 里的常量定义，不在数据库层约束 ——
+    新增状态时不想每次都写迁移。
+    `login_email_window_hours` 是该账号登录时等验证码的窗口长度，
+    0 表示不启用窗口，上限 720 小时由 CheckConstraint 兜住。
+    """
+
     __tablename__ = "tg_accounts"
     __table_args__ = (
         CheckConstraint(
@@ -61,6 +84,13 @@ class TgAccount(Base):
 
 
 class TgSession(Base):
+    """账号的登录会话，存的是加密后的 Telethon StringSession。
+
+    session_encrypted 等同账号凭证，能解密它就能操作该账号。
+    轮换时把旧行置 is_active=False 而不是删除，保留审计轨迹；
+    文件末尾的部分唯一索引保证同一账号同时只有一条 active。
+    """
+
     __tablename__ = "tg_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

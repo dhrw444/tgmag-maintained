@@ -5,7 +5,6 @@ import io
 import re
 import shlex
 import tempfile
-import urllib.request
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -112,6 +111,15 @@ from app.services.login_email_protection import (
     set_whitelisted,
 )
 from app.services.pagination import ACCOUNT_PAGE_SIZE, account_page_window
+from app.services.account_shared import (
+    MAX_AVATAR_BYTES,
+    EmailCodeRequired,
+    RANDOM_AVATAR_URLS,
+    build_session_export,
+    download_url_to_file,
+    parse_account_selection,
+    require_email_code,
+)
 from app.services.qr_code import login_qr_png
 from app.services.rate_limit import RateGate, get_rate, validate_rate_values
 from app.services.security_health import run_security_health_check
@@ -172,20 +180,6 @@ async def configure_bot_ui(bot: Bot) -> None:
     await bot.set_my_commands(BOT_COMMANDS)
     await bot.set_chat_menu_button(menu_button=bot_menu_button())
 
-RANDOM_AVATAR_URLS = [
-    "https://api.btstu.cn/sjbz/api.php?lx=dongman&format=images",
-    "https://api.btstu.cn/sjbz/api.php?lx=meizi&format=images",
-    "https://img.xjh.me/random_img.php?return=302&type=bg&ctype=acg",
-    "https://picsum.photos/1200/1200.jpg",
-    "https://picsum.photos/1024/1024.jpg",
-]
-MAX_IMAGE_SIZE = 5 * 1024 * 1024
-
-class EmailCodeRequired(Exception):
-    def __init__(self, code_length: int):
-        self.code_length = code_length
-        super().__init__(f"email confirmation code required: {code_length}")
-
 
 def split_hint_email(parts: list[str], hint_index: int) -> tuple[str | None, str | None]:
     if len(parts) <= hint_index:
@@ -196,10 +190,6 @@ def split_hint_email(parts: list[str], hint_index: int) -> tuple[str | None, str
         email = tail.pop()
     hint = " ".join(tail) or None
     return hint, email
-
-
-def require_email_code(code_length: int) -> str:
-    raise EmailCodeRequired(code_length)
 
 
 def args(message: Message) -> list[str]:
@@ -240,88 +230,6 @@ async def account_ids_from_range(session: AsyncSession, start_id: int, count: in
         .limit(count)
     )
     return list(rows.all())
-
-
-def parse_account_selection(value: str) -> list[int]:
-    tokens = [token.strip() for token in value.replace("，", ",").replace(" ", ",").split(",")]
-    account_ids: list[int] = []
-    seen: set[int] = set()
-    for token in tokens:
-        if not token:
-            continue
-        if "-" in token:
-            start_raw, end_raw = token.split("-", 1)
-            start_id, end_id = int(start_raw), int(end_raw)
-            if start_id > end_id:
-                start_id, end_id = end_id, start_id
-            values = range(start_id, end_id + 1)
-        else:
-            values = [int(token)]
-        for account_id in values:
-            if account_id <= 0:
-                raise ValueError("账号ID必须为正整数")
-            if account_id not in seen:
-                seen.add(account_id)
-                account_ids.append(account_id)
-                if len(account_ids) > 200:
-                    raise ValueError("一次最多选择 200 个账号")
-    if not account_ids:
-        raise ValueError("没有识别到账号ID")
-    return account_ids
-
-
-async def build_session_export(session: AsyncSession, account_ids: list[int]) -> tuple[str, int, list[str]]:
-    lines = [
-        "# Telethon StringSession export",
-        f"# generated_at={datetime.now(timezone.utc).isoformat()}",
-        "# 警告：string_session 等同于账号登录凭证，请不要发给不可信的人。",
-        "# 导入时使用 phone 和 string_session 两项。",
-        "",
-    ]
-    exported = 0
-    skipped: list[str] = []
-    for account_id in account_ids:
-        account = await session.get(TgAccount, account_id)
-        if account is None:
-            skipped.append(f"#{account_id}: 账号不存在")
-            continue
-        tg_session = await session.scalar(
-            select(TgSession)
-            .where(TgSession.account_id == account.id, TgSession.is_active.is_(True))
-            .order_by(TgSession.id.desc())
-            .limit(1)
-        )
-        if tg_session is None:
-            skipped.append(f"#{account.id}: 没有 active session")
-            continue
-        try:
-            phone = decrypt_text(account.phone_encrypted) or account.phone_masked
-            session_str = decrypt_text(tg_session.session_encrypted)
-        except Exception as exc:
-            skipped.append(f"#{account.id}: 解密失败 {exc}")
-            continue
-        if not session_str:
-            skipped.append(f"#{account.id}: session 为空")
-            continue
-        exported += 1
-        lines.extend(
-            [
-                "[account]",
-                f"account_id={account.id}",
-                f"telegram_user_id={account.user_id or ''}",
-                f"username={('@' + account.username) if account.username else ''}",
-                f"phone={phone}",
-                f"phone_masked={account.phone_masked}",
-                "session_type=telethon_string",
-                f"string_session={session_str}",
-                "",
-            ]
-        )
-    if skipped:
-        lines.append("[skipped]")
-        lines.extend(skipped)
-        lines.append("")
-    return "\n".join(lines), exported, skipped
 
 
 async def send_session_export(
@@ -716,26 +624,6 @@ async def prompt_post_login_security(
     text = post_login_security_text(account, twofa_info)
     if text:
         await message.answer(text, reply_markup=post_login_security_panel(account.id))
-
-
-def download_url_to_file(url: str, path: Path) -> None:
-    if url not in RANDOM_AVATAR_URLS or not url.startswith("https://"):
-        raise ValueError("不允许的随机头像来源")
-    request = urllib.request.Request(url, headers={"User-Agent": "tg-account-bot/0.1"})
-    # URL is selected from the immutable HTTPS allowlist above, never user input.
-    with urllib.request.urlopen(request, timeout=20) as response:  # nosec B310
-        payload = response.read(MAX_IMAGE_SIZE + 1)
-    if len(payload) > MAX_IMAGE_SIZE:
-        raise ValueError("图片超过 5MB 限制")
-    header = payload[:16]
-    if not (
-        header.startswith(b"\xff\xd8\xff")
-        or header.startswith(b"\x89PNG")
-        or header.startswith(b"RIFF")
-        or header.startswith(b"GIF8")
-    ):
-        raise ValueError("接口返回的不是可识别图片")
-    path.write_bytes(payload)
 
 
 @router.message(Command("start", "menu"))
@@ -2067,7 +1955,7 @@ async def profile_edit_value(
             if source is None:
                 await ask_with_cancel(message, "请发送图片，或以文件形式发送图片。", "发送图片")
                 return
-            if getattr(source, "file_size", 0) and source.file_size > MAX_IMAGE_SIZE:
+            if getattr(source, "file_size", 0) and source.file_size > MAX_AVATAR_BYTES:
                 await ask_with_cancel(message, "图片不能超过 5MB，请重新发送。", "发送图片")
                 return
             with tempfile.NamedTemporaryFile(prefix="tg_avatar_", suffix=suffix, delete=False) as tmp:
