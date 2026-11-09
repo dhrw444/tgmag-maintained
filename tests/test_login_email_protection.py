@@ -602,3 +602,66 @@ def test_premium_related_notices(text):
 @pytest.mark.parametrize("text", ["", "Login code: 12345", "Your login email was changed", "Telegram update", "@premium_support", "premiumize", "您的會員訂閱即將到期", "プレミアム"])
 def test_unrelated_notices_are_not_premium(text):
     assert not login_email_protection.is_premium_notice(text)
+
+def test_manual_email_wait_recheck_constant_governs_db_polling(monkeypatch) -> None:
+    """手动等邮件期间的开库频率由 MANUAL_WAIT_RECHECK_SECONDS 决定，不再是每秒一次。
+
+    这条测试锁住的是常驻空转量：一次 5 分钟的手动等待，旧实现
+    （`await asyncio.sleep(min(manual_wait, 1))`）会开约 300 次数据库会话，
+    现在按常量（10 秒）开约 30 次，每次会话含一次 SELECT。
+
+    这里不真的等 5 分钟：把 asyncio.sleep 换成记录参数并立即返回的替身，
+    于是「睡多久」这件事本身可断言，循环仍在同一轮里推进。
+    """
+    event = SimpleNamespace(
+        id=91,
+        account_id=4,
+        status="waiting_window",
+        window_ends_at=datetime.now(UTC),
+    )
+    opened = {"n": 0}
+
+    class Session:
+        def __init__(self) -> None:
+            opened["n"] += 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, model, key):
+            return event
+
+    class Sessionmaker:
+        def __call__(self):
+            return Session()
+
+    protector = LoginEmailProtector.__new__(LoginEmailProtector)
+    protector.sessionmaker = Sessionmaker()
+    protector._window_waiters = {}
+    protector._account_locks = {}
+    protector._change_locks = {}
+    protector._prepare_window_change = AsyncMock(return_value=(4, "a@b.c", "b.c"))
+    protector._execute_change = AsyncMock()
+
+    manual = {"remaining": 60.0}
+    protector.manual_email_wait_remaining = lambda account_id: manual["remaining"]
+
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        manual["remaining"] = 0.0
+
+    monkeypatch.setattr(login_email_protection.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(protector.wait_for_window(91, object()))
+
+    # 窗口已过期（delay <= 0），所以唯一一次 sleep 来自手动等邮件分支，
+    # 且被常量封顶，而不是旧实现里的 1 秒。
+    assert slept == [login_email_protection.MANUAL_WAIT_RECHECK_SECONDS]
+    assert login_email_protection.MANUAL_WAIT_RECHECK_SECONDS > 1
+    # 每轮复检开一个会话：这一轮开 2 次（进入手动分支前一次，复检后一次）。
+    assert opened["n"] == 2
