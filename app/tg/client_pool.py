@@ -1,3 +1,23 @@
+"""Telethon 客户端池与后台监控。
+
+一个进程内维护 `account_id -> TelegramClient` 的映射。设计上刻意不做池化上限：
+每个受管理账号都需要一条常驻 MTProto 连接，账号数由 pagination.MAX_SYSTEM_ACCOUNTS
+在入库时限制，这里不再重复限制。
+
+三条后台任务：
+- `_monitor_loop`：周期性检查连接，掉线的重连。间隔来自配置，默认较长。
+- 服务消息监听：对每个 client 注册 NewMessage 事件，只收 777000（Telegram 官方
+  服务号）的消息，用来识别换绑邮箱、封禁等系统通知。
+- 登录邮箱保护的窗口等待任务：由 LoginEmailProtector 自己管，这里只提供 client。
+
+并发要点：`get_client` 用单把锁串行化创建，因为 Telethon 的 connect 不是幂等的，
+两个协程同时给同一个账号建 client 会产生两条 session。锁内做网络 IO 是刻意的取舍 ——
+创建路径低频，正确性优先。
+
+`_deleting_account_ids` 是删除流程的互斥标记：删除期间所有会碰该账号的入口先查它，
+避免删到一半又被监控重连起来。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +48,11 @@ REALTIME_SERVICE_SOURCE_IDS = {777000}
 
 
 class ClientPool:
+    """受管理账号的 Telethon 客户端集合。
+
+    生命周期与进程一致，由 app.main 创建并传给 Bot 与 Mini App。
+    """
+
     def __init__(self, sessionmaker: async_sessionmaker[AsyncSession], bot: Bot):
         self.sessionmaker = sessionmaker
         self.bot = bot
@@ -54,6 +79,11 @@ class ClientPool:
         return bool(self.monitor_enabled and task is not None and not task.done())
 
     async def start_service_monitor(self) -> None:
+        """连上所有 active 账号，可选做一次登录邮箱保护自检，然后起监控循环。
+
+        幂等：循环已在跑时不会重复创建任务。启动时会顺带把库里没跑完的换绑窗口
+        恢复回来，因此这个函数在每次重连后也被复用。
+        """
         self.monitor_enabled = True
         await self.connect_all_active()
         if settings.login_email_protection_enabled:
@@ -66,6 +96,11 @@ class ClientPool:
         await self.restore_pending_protection_windows()
 
     async def restore_pending_protection_windows(self) -> None:
+        """把库里停在 waiting_window / waiting_email 的事件重新挂上。
+
+        只处理 parent_event_id 为空的顶层事件；子事件由父事件驱动。
+        已经在等待的任务不重复挂 —— 这是幂等的关键，监控循环每分钟都会调一次。
+        """
         async with self.sessionmaker() as session:
             events_to_restore = list(
                 (
@@ -110,6 +145,10 @@ class ClientPool:
             self._track_protection_task(task)
 
     async def stop_service_monitor(self) -> None:
+        """停监控、取消全部保护任务、断开所有连接。
+
+        顺序不能反：先取消任务再断开连接，否则任务在断开后醒来会拿到死 client。
+        """
         self.monitor_enabled = False
         task, self._monitor_task = self._monitor_task, None
         if task is not None:
@@ -124,6 +163,11 @@ class ClientPool:
         await self.disconnect_all()
 
     async def _monitor_loop(self) -> None:
+        """周期性重连 + 恢复未完成窗口。单次失败只记日志，不终止循环。
+
+        间隔下限 30 秒是硬编码的：更密的检查对掉线恢复没有实质帮助，
+        却会让每个账号每分钟多几次无意义的 is_connected 判断。
+        """
         while self.monitor_enabled:
             await asyncio.sleep(max(30, settings.service_monitor_interval_seconds))
             if not self.monitor_enabled:
@@ -135,6 +179,7 @@ class ClientPool:
                 logger.exception("Periodic Telegram client reconnect failed")
 
     async def connect_all_active(self) -> None:
+        """连上所有 is_active 的 session。单个账号失败不影响其他账号。"""
         async with self.sessionmaker() as session:
             rows = await session.scalars(
                 select(TgSession.account_id)
@@ -149,6 +194,7 @@ class ClientPool:
                 logger.exception("Failed to connect account %s", account_id)
 
     async def disconnect_all(self) -> None:
+        """断开全部客户端但保留 clients 字典，便于之后重连时复用同一批对象。"""
         for account_id, client in list(self.clients.items()):
             try:
                 await client.disconnect()
@@ -185,6 +231,7 @@ class ClientPool:
             )
 
     async def drop(self, account_id: int) -> None:
+        """断开并移除单个账号的客户端。账号不存在时静默返回。"""
         client = self.clients.pop(account_id, None)
         if client:
             try:
@@ -227,6 +274,7 @@ class ClientPool:
             raise
 
     async def end_account_deletion(self, account_id: int) -> None:
+        """解除删除互斥标记。删除流程无论成功失败都必须在 finally 里调用。"""
         async with self._lock:
             self._deleting_account_ids.discard(account_id)
 
@@ -250,6 +298,13 @@ class ClientPool:
         self._track_protection_task(task)
 
     async def get_client(self, account_id: int) -> TelegramClient:
+        """取（必要时创建）账号的 Telethon 客户端并确保已连接。
+
+        锁内完成创建和连接：Telethon 的 connect 不幂等，并发创建同一账号会产生
+        两条 session。已经连接的直接返回，不走锁。
+
+        删除中的账号抛 ValueError，session 无效的账号会先标记再抛。
+        """
         async with self._lock:
             if account_id in self._deleting_account_ids:
                 raise ValueError(f"账号 {account_id} 正在删除")
@@ -287,6 +342,11 @@ class ClientPool:
             return client
 
     async def _mark_session_invalid(self, account_id: int, error: str) -> None:
+        """把账号的 session 标记为失效并同步账号状态。
+
+        只在 AuthKeyDuplicatedError 时调用 —— 那意味着同一 session 在别处登录过，
+        本地这份已经作废，重连没有意义。
+        """
         async with self.sessionmaker() as session:
             await session.execute(
                 update(TgSession)
@@ -304,6 +364,12 @@ class ClientPool:
         account_id: int,
         client: TelegramClient,
     ) -> None:
+        """补处理最近一段时间内的换绑提醒。
+
+        服务消息监听只在进程运行期间有效，重启会漏掉期间到达的提醒。
+        这个函数在启动后拉一次历史补上。时间窗口由配置决定，不处理全部历史，
+        否则首次启动会对老账号做大量无意义的 API 调用。
+        """
         catchup_seconds = settings.login_email_catchup_seconds
         if (
             not self.monitor_enabled
@@ -338,6 +404,10 @@ class ClientPool:
         notice: LoginEmailWindowNotice,
         client: TelegramClient,
     ) -> None:
+        """为一条提醒安排窗口等待任务，并把任务登记进 _protection_tasks 便于取消。
+
+        任务名带 event_id 后缀，begin_account_deletion 靠它找出关联任务。
+        """
         if not notice.starts_new_window:
             return
         task = asyncio.create_task(
@@ -413,6 +483,11 @@ class ClientPool:
         received_at: datetime,
         client: TelegramClient,
     ) -> None:
+        """把一条 777000 服务消息落库并分发处理。
+
+        用 per-account 锁串行化：同一条消息可能从实时监听和历史补拉两条路径到达，
+        锁内按 (account_id, message_id) 去重，保证只处理一次。
+        """
         lock = self._service_message_locks.setdefault(account_id, asyncio.Lock())
         async with lock:
             text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -497,6 +572,11 @@ class ClientPool:
     async def _handle_service_message(
         self, account_id: int, event: events.NewMessage.Event
     ) -> None:
+        """识别消息类型并触发对应动作。
+
+        只有换绑邮箱类提醒会进入保护流程；其他类型（封禁、登录提醒）目前只落库
+        供人查，不自动处理 —— 自动应对这类消息的风险远大于收益。
+        """
         if not self.monitor_enabled:
             return
         if not event.is_private:
