@@ -1,3 +1,8 @@
+"""登录邮箱保护的主流程：提醒识别、验证码解析、窗口等待、换绑执行与失败分类。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 from __future__ import annotations
 
 import asyncio

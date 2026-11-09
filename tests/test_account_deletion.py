@@ -1,3 +1,8 @@
+"""账号删除的完整性与引用清理。重点是删完之后不能留下任何能指向该账号的 JSON 残留。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 from __future__ import annotations
 
 import asyncio

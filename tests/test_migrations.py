@@ -1,3 +1,8 @@
+"""迁移链能否在空库上跑通，以及 head 版本号是否与 init_db 的期望一致。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 from pathlib import Path
 
 

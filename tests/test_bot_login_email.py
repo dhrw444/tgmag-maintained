@@ -1,3 +1,8 @@
+"""Bot 侧等邮件流程的状态推进：手动提交验证码、窗口截止、取消。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace

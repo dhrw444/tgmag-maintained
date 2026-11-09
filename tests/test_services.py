@@ -1,3 +1,8 @@
+"""服务层纯函数：目标解析、限流、分页窗口、账号选择语法。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace

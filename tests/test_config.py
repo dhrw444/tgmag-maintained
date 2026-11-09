@@ -1,3 +1,8 @@
+"""配置解析与校验：非法值必须抛错而不是静默回落到默认值。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 from pathlib import Path
 
 import pytest

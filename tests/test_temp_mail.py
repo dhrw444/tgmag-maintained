@@ -1,3 +1,8 @@
+"""临时邮箱 webhook 的入库与按收件人查询，含白名单过滤和重复投递。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace

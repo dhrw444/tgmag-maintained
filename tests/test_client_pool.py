@@ -1,3 +1,8 @@
+"""客户端池的连接/重连/删除互斥/服务消息去重。用假 client 替身，不连真实 Telegram。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 import asyncio
 
 import pytest

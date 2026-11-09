@@ -1,3 +1,8 @@
+"""Mini App 端点：鉴权拒绝、请求体上限、webhook 路径校验。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 from __future__ import annotations
 
 import asyncio

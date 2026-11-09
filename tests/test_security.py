@@ -1,3 +1,8 @@
+"""鉴权与加密：init_data 验签、管理员判定、密文往返。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 import asyncio
 import hashlib
 import hmac

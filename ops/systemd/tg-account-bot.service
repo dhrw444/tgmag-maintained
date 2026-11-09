@@ -1,3 +1,12 @@
+# systemd 单元。
+#
+# 单实例是硬要求：ClientPool 和 advisory lock 都假设一个进程，
+# 起两个副本会让同一账号被两条 MTProto 连接驱动，Telegram 侧会踢掉其中一条。
+#
+# 沙箱参数按最小权限给：只允许写 data/，其余文件系统只读；
+# CapabilityBoundingSet 置空表示不需要任何 capability。
+# Restart=always + RestartSec=5 是进程内没有自恢复逻辑的补偿 ——
+# 数据库短时不可用时进程会退出，由 systemd 拉起来。
 [Unit]
 Description=Telegram Account Management Bot
 After=network-online.target postgresql.service

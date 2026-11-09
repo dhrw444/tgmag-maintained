@@ -1,3 +1,8 @@
+"""键盘布局与 callback_data 格式。callback_data 是字符串协议，这里锁住它的形状。
+
+本文件不连真实 Telegram / 不写真实凭据，全部走替身与内存夹具。
+"""
+
 import ast
 import asyncio
 from pathlib import Path
