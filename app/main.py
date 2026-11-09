@@ -1,3 +1,14 @@
+"""服务入口。
+
+一个进程里同时跑三件事：Telegram Bot 长轮询、账号后台监控、可选的 Mini App
+HTTP 服务。三者共用同一个数据库会话工厂和同一个 ClientPool，因此必须同生共死 ——
+任一环节起不来就整体退出，不做降级运行，否则会出现「Bot 在回消息但账号全断线」
+这种更难排查的半死状态。
+
+部署形态由 systemd 单实例托管（见 ops/systemd/tg-account-bot.service），
+所以这里没有多副本协调逻辑，advisory lock 只用来防同进程内的并发。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -32,6 +43,15 @@ async def restore_admin_keyboards(bot: Bot) -> None:
 
 
 async def main() -> None:
+    """服务入口：初始化依赖，然后进入 Bot 长轮询。
+
+    启动顺序有依赖，不能调换：建目录 → init_db（校验 alembic 版本）→
+    写默认配置 → 恢复未完成的换绑事件 → 起 Mini App → 起账号监控 →
+    进 polling。前四步任何一步失败都应该让进程退出，因为后面的模块
+    都假设数据库结构已经就绪。
+
+    finally 里逆序清理：先停 Mini App，再停监控，最后关 Bot 的 aiohttp session。
+    """
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",

@@ -1,9 +1,24 @@
+"""Bot 输出格式化。
+
+这里只有两块：单账号一行的渲染，以及 /cmd 指令总表。
+
+COMMANDS 是给人看的文案，不是注册来源 —— 实际注册在 handlers 的 Command(...)
+里。两者可能不一致（例如只有回调没有命令的入口），改命令时两边都要看，
+测试 test_bot_ui 只校验已声明的命令都能被响应，不校验反向。
+"""
+
 from __future__ import annotations
 
 from app.db.models import TgAccount
 
 
 def account_line(account: TgAccount) -> str:
+    """把账号渲染成列表里的一行：#id 掩码手机号 @用户名 姓名 [状态]。
+
+    未知状态原样输出而不是显示「未知」，因为 status 是自由字符串，
+    原样输出能让人看出库里到底存了什么。
+    """
+
     username = f"@{account.username}" if account.username else "-"
     name = " ".join(part for part in [account.first_name, account.last_name] if part) or "-"
     status_labels = {

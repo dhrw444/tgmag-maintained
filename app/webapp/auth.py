@@ -1,3 +1,17 @@
+"""Mini App 鉴权。
+
+Telegram 打开 Mini App 时通过 X-Telegram-Init-Data 头传一段查询串，里面带
+user 字段和一个 hash。hash 是 HMAC-SHA256 签名，密钥由 bot_token 派生，
+因此伪造不了 —— 这是 Mini App 唯一的身份来源，不接受任何别的凭据。
+
+校验顺序刻意是「先格式、再时效、最后验签」：验签要遍历全部字段做排序拼接，
+放在最前面等于允许未签名的请求驱动一次完整的 HMAC 计算。时效检查允许
+60 秒的未来偏差（客户端时钟不准），超过 mini_app_auth_max_age_seconds 的
+init_data 视为重放。
+
+权限判据和 Bot 侧保持一致：先查 admins 表，表里没有才回落到 ADMIN_IDS。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -17,6 +31,8 @@ from app.db.models import Admin
 
 @dataclass(frozen=True)
 class MiniAppUser:
+    """init_data 里验签通过的用户身份。只有这几个字段是可信的，其余一律不信。"""
+
     id: int
     username: str | None = None
     first_name: str | None = None
@@ -24,6 +40,12 @@ class MiniAppUser:
 
 
 def validate_init_data(init_data: str) -> MiniAppUser:
+    """校验 init_data 签名与时效，返回身份；任何一步不合法抛 HTTPUnauthorized。
+
+    抛出的都是 web.HTTPUnauthorized，调用方不需要再包装 —— aiohttp 会直接
+    转成 401 响应。
+    """
+
     values = dict(parse_qsl(init_data, keep_blank_values=True))
     received_hash = values.pop("hash", None)
     if not received_hash:
@@ -68,6 +90,11 @@ async def require_admin(
     request: web.Request,
     sessionmaker: async_sessionmaker[AsyncSession],
 ) -> MiniAppUser:
+    """要求请求方是已激活的管理员，否则抛 HTTPForbidden。
+
+    数据库不可用时这里抛 SQLAlchemy 异常而不是 403 —— 那是服务端故障，
+    不该被伪装成权限拒绝。
+    """
     init_data = request.headers.get("X-Telegram-Init-Data", "")
     user = validate_init_data(init_data)
     async with sessionmaker() as session:
