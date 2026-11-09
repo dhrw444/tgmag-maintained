@@ -4,6 +4,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
+"""账号级登录邮箱等待窗口配置。"""
+
 revision = "0008_account_email_window"
 down_revision = "0007_login_email_window"
 branch_labels = None

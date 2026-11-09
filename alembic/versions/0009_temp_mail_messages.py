@@ -4,6 +4,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
+"""临时邮箱收件箱表，Cloudflare TempMail webhook 的落库目标。"""
+
 revision = "0009_temp_mail_messages"
 down_revision = "0008_account_email_window"
 branch_labels = None

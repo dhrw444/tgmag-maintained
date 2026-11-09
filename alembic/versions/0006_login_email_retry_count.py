@@ -3,6 +3,12 @@ from __future__ import annotations
 from alembic import op
 import sqlalchemy as sa
 
+"""login_email_protection_events 增加 attempt_count。
+
+先用 inspector 查列是否存在再决定加不加，而不是直接 add_column ——
+这个迁移在早期部署上可能被手工执行过一部分，重复执行应当安全。
+"""
+
 revision = "0006_login_email_retry_count"
 down_revision = "0005_login_email_protection"
 branch_labels = None

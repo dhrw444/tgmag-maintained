@@ -4,6 +4,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
+"""事件聚合窗口：同一账号短时间内的多条提醒合并成一个事件。"""
+
 revision = "0007_login_email_window"
 down_revision = "0006_login_email_retry_count"
 branch_labels = None

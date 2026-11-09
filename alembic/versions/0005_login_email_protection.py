@@ -3,6 +3,8 @@ from __future__ import annotations
 from alembic import op
 import sqlalchemy as sa
 
+"""建立登录邮箱保护的初始表结构。"""
+
 revision = "0005_login_email_protection"
 down_revision = "0004_data_integrity"
 branch_labels = None

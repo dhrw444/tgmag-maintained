@@ -1,3 +1,9 @@
+"""初始 schema：管理员、账号、会话、服务消息、限流、审计、作业。
+
+一次性建全所有基础表，后续迁移只做增量。表之间的外键顺序在这里已经是
+拓扑序（父表在前），回滚时 drop_all 走反向即可。
+"""
+
 from __future__ import annotations
 
 from alembic import op

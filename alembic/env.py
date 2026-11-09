@@ -1,3 +1,12 @@
+"""Alembic 运行环境。
+
+连接串直接取 app.config.settings.database_url，不读 alembic.ini 的
+sqlalchemy.url —— 配置只有一个来源，避免两处不一致。
+
+异步驱动（asyncpg）需要用 run_sync 把同步的迁移逻辑包进事件循环；
+离线模式（--sql）只生成 SQL 不连库，因此走另一条分支。
+"""
+
 from __future__ import annotations
 
 import asyncio

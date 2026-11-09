@@ -3,6 +3,16 @@ from __future__ import annotations
 from alembic import op
 import sqlalchemy as sa
 
+"""补三条数据完整性约束。
+
+- tg_accounts.user_id 部分唯一索引：user_id 为 NULL 的行不受约束，因为
+  未同步资料的账号允许并存；一旦同步出 user_id 就不允许重复。
+- tg_sessions 每个账号只能有一条 is_active：靠部分唯一索引在数据库层兜住，
+  应用层「先置旧行为 False」如果被绕过也不会出现双活 session。
+- rate_limits 的三个 CHECK：max_actions / per_seconds 必须为正，
+  jitter_min <= jitter_max。纯防御，正常代码路径不会违反。
+"""
+
 revision = "0004_data_integrity"
 down_revision = "0003_service_source_unique"
 branch_labels = None
